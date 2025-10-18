@@ -431,9 +431,9 @@ pub async fn serve(
             .with(GovernorMiddleware::new(did_limiter))
             .with(GovernorMiddleware::new(ip_limiter));
 
-        app = app.at("/:any", get(proxy).post(upstream_proxier));
+        app = app.at("/*", get(proxy).post(upstream_proxier));
     } else {
-        app = app.at("/:any", get(proxy).post(nope));
+        app = app.at("/*", get(proxy).post(nope));
     }
 
     let app = app

@@ -2,7 +2,7 @@
 name = "allegedly"
 description = "public ledger server tools and services (for the PLC)"
 license = "MIT OR Apache-2.0"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 default-run = "allegedly"
 
