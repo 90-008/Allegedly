@@ -419,7 +419,8 @@ pub async fn serve(
     let mut app = Route::new()
         .at("/", get(hello))
         .at("/favicon.ico", get(favicon))
-        .at("/_health", get(health));
+        .at("/_health", get(health))
+        .at("/export", get(proxy));
 
     if experimental.write_upstream {
         log::info!("enabling experimental write forwarding to upstream");
