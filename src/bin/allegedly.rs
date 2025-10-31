@@ -1,4 +1,5 @@
-use allegedly::{Dt, bin::GlobalArgs, bin_init, pages_to_stdout, pages_to_weeks, poll_upstream};
+use allegedly::bin::{GlobalArgs, InstrumentationArgs, bin_init};
+use allegedly::{Dt, logo, pages_to_stdout, pages_to_weeks, poll_upstream};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::{path::PathBuf, time::Duration, time::Instant};
 use tokio::fs::create_dir_all;
@@ -48,11 +49,15 @@ enum Commands {
     Mirror {
         #[command(flatten)]
         args: mirror::Args,
+        #[command(flatten)]
+        instrumentation: InstrumentationArgs,
     },
     /// Wrap any did-method-plc server, without syncing upstream (read-only)
     Wrap {
         #[command(flatten)]
         args: mirror::Args,
+        #[command(flatten)]
+        instrumentation: InstrumentationArgs,
     },
     /// Poll an upstream PLC server and log new ops to stdout
     Tail {
@@ -62,12 +67,27 @@ enum Commands {
     },
 }
 
+impl Commands {
+    fn enable_otel(&self) -> bool {
+        match self {
+            Commands::Mirror {
+                instrumentation, ..
+            }
+            | Commands::Wrap {
+                instrumentation, ..
+            } => instrumentation.enable_opentelemetry,
+            _ => false,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     let matches = Cli::command().get_matches();
     let name = matches.subcommand().map(|(name, _)| name).unwrap_or("???");
-    bin_init(name);
+    bin_init(args.command.enable_otel());
+    log::info!("{}", logo(name));
 
     let globals = args.globals.clone();
 
@@ -96,8 +116,8 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .expect("to write bundles to output files");
         }
-        Commands::Mirror { args } => mirror::run(globals, args, true).await?,
-        Commands::Wrap { args } => mirror::run(globals, args, false).await?,
+        Commands::Mirror { args, .. } => mirror::run(globals, args, true).await?,
+        Commands::Wrap { args, .. } => mirror::run(globals, args, false).await?,
         Commands::Tail { after } => {
             let mut url = globals.upstream;
             url.set_path("/export");

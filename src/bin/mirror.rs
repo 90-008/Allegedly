@@ -1,5 +1,7 @@
 use allegedly::{
-    Db, ExperimentalConf, ListenConf, bin::GlobalArgs, bin_init, pages_to_pg, poll_upstream, serve,
+    Db, ExperimentalConf, ListenConf,
+    bin::{GlobalArgs, InstrumentationArgs, bin_init},
+    logo, pages_to_pg, poll_upstream, serve,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -166,6 +168,8 @@ struct CliArgs {
     #[command(flatten)]
     globals: GlobalArgs,
     #[command(flatten)]
+    instrumentation: InstrumentationArgs,
+    #[command(flatten)]
     args: Args,
     /// Run the mirror in wrap mode, no upstream synchronization (read-only)
     #[arg(long, action)]
@@ -176,7 +180,8 @@ struct CliArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
-    bin_init("mirror");
+    bin_init(args.instrumentation.enable_opentelemetry);
+    log::info!("{}", logo("mirror"));
     run(args.globals, args.args, !args.wrap_mode).await?;
     Ok(())
 }

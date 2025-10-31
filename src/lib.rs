@@ -145,16 +145,3 @@ pub fn logo(name: &str) -> String {
         env!("CARGO_PKG_VERSION"),
     )
 }
-
-pub fn bin_init(name: &str) {
-    if std::env::var_os("RUST_LOG").is_none() {
-        unsafe { std::env::set_var("RUST_LOG", "info") };
-    }
-    let filter = tracing_subscriber::EnvFilter::from_default_env();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .init();
-
-    log::info!("{}", logo(name));
-}

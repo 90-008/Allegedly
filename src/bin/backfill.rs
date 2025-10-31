@@ -1,6 +1,7 @@
 use allegedly::{
-    Db, Dt, ExportPage, FolderSource, HttpSource, backfill, backfill_to_pg, bin::GlobalArgs,
-    bin_init, full_pages, pages_to_pg, pages_to_stdout, poll_upstream,
+    Db, Dt, ExportPage, FolderSource, HttpSource, backfill, backfill_to_pg,
+    bin::{GlobalArgs, bin_init},
+    full_pages, logo, pages_to_pg, pages_to_stdout, poll_upstream,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -199,7 +200,8 @@ struct CliArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
-    bin_init("backfill");
+    bin_init(false);
+    log::info!("{}", logo("backfill"));
     run(args.globals, args.args).await?;
     Ok(())
 }
