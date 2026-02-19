@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
+
 use tokio::sync::{mpsc, oneshot};
 
 mod backfill;
 mod cached_value;
 mod client;
+pub mod doc;
 mod mirror;
+mod plc_fjall;
 mod plc_pg;
 mod poll;
 mod ratelimit;
@@ -15,7 +18,8 @@ pub mod bin;
 pub use backfill::backfill;
 pub use cached_value::{CachedValue, Fetcher};
 pub use client::{CLIENT, UA};
-pub use mirror::{ExperimentalConf, ListenConf, serve};
+pub use mirror::{ExperimentalConf, ListenConf, serve, serve_fjall};
+pub use plc_fjall::{FjallDb, backfill_to_fjall, pages_to_fjall};
 pub use plc_pg::{Db, backfill_to_pg, pages_to_pg};
 pub use poll::{PageBoundaryState, get_page, poll_upstream};
 pub use ratelimit::{CreatePlcOpLimiter, GovernorMiddleware, IpLimiters};

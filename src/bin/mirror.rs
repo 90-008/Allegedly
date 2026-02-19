@@ -1,7 +1,7 @@
 use allegedly::{
-    Db, ExperimentalConf, ListenConf,
+    Db, ExperimentalConf, FjallDb, ListenConf,
     bin::{GlobalArgs, InstrumentationArgs, bin_init},
-    logo, pages_to_pg, poll_upstream, serve,
+    logo, pages_to_fjall, pages_to_pg, poll_upstream, serve, serve_fjall,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -10,15 +10,18 @@ use tokio::{fs::create_dir_all, sync::mpsc, task::JoinSet};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// the wrapped did-method-plc server
+    /// the wrapped did-method-plc server (not needed when using --wrap-fjall)
     #[arg(long, env = "ALLEGEDLY_WRAP")]
-    wrap: Url,
+    wrap: Option<Url>,
     /// the wrapped did-method-plc server's database (write access required)
-    #[arg(long, env = "ALLEGEDLY_WRAP_PG")]
+    #[arg(long, env = "ALLEGEDLY_WRAP_PG", conflicts_with = "wrap_fjall")]
     wrap_pg: Option<Url>,
     /// path to tls cert for the wrapped postgres db, if needed
     #[arg(long, env = "ALLEGEDLY_WRAP_PG_CERT")]
     wrap_pg_cert: Option<PathBuf>,
+    /// path to a local fjall database directory (alternative to postgres)
+    #[arg(long, env = "ALLEGEDLY_WRAP_FJALL", conflicts_with_all = ["wrap_pg", "wrap_pg_cert"])]
+    wrap_fjall: Option<PathBuf>,
     /// wrapping server listen address
     #[arg(short, long, env = "ALLEGEDLY_BIND")]
     #[clap(default_value = "127.0.0.1:8000")]
@@ -70,6 +73,7 @@ pub async fn run(
         wrap,
         wrap_pg,
         wrap_pg_cert,
+        wrap_fjall,
         bind,
         acme_domain,
         acme_cache_path,
@@ -106,17 +110,12 @@ pub async fn run(
 
     let mut tasks = JoinSet::new();
 
-    let db = if sync {
-        let wrap_pg = wrap_pg.ok_or(anyhow::anyhow!(
-            "a wrapped reference postgres must be provided to sync"
-        ))?;
-        let db = Db::new(wrap_pg.as_str(), wrap_pg_cert).await?;
+    if let Some(fjall_path) = wrap_fjall {
+        let db = FjallDb::open(&fjall_path)?;
 
-        // TODO: allow starting up with polling backfill from beginning?
-        log::debug!("getting the latest op from the db...");
+        log::debug!("getting the latest op from fjall...");
         let latest = db
-            .get_latest()
-            .await?
+            .get_latest()?
             .expect("there to be at least one op in the db. did you backfill?");
 
         let (send_page, recv_page) = mpsc::channel(8);
@@ -126,19 +125,41 @@ pub async fn run(
         let throttle = Duration::from_millis(upstream_throttle_ms);
 
         tasks.spawn(poll_upstream(Some(latest), poll_url, throttle, send_page));
-        tasks.spawn(pages_to_pg(db.clone(), recv_page));
-        Some(db)
-    } else {
-        None
-    };
+        tasks.spawn(pages_to_fjall(db.clone(), recv_page));
 
-    tasks.spawn(serve(
-        upstream,
-        wrap,
-        listen_conf,
-        experimental_conf,
-        db.clone(),
-    ));
+        tasks.spawn(serve_fjall(upstream, listen_conf, experimental_conf, db));
+    } else {
+        let wrap = wrap.ok_or(anyhow::anyhow!(
+            "--wrap is required unless using --wrap-fjall"
+        ))?;
+
+        let db: Option<Db> = if sync {
+            let wrap_pg = wrap_pg.ok_or(anyhow::anyhow!(
+                "a wrapped reference postgres (--wrap-pg) or fjall db (--wrap-fjall) must be provided to sync"
+            ))?;
+            let db = Db::new(wrap_pg.as_str(), wrap_pg_cert).await?;
+
+            log::debug!("getting the latest op from the db...");
+            let latest = db
+                .get_latest()
+                .await?
+                .expect("there to be at least one op in the db. did you backfill?");
+
+            let (send_page, recv_page) = mpsc::channel(8);
+
+            let mut poll_url = upstream.clone();
+            poll_url.set_path("/export");
+            let throttle = Duration::from_millis(upstream_throttle_ms);
+
+            tasks.spawn(poll_upstream(Some(latest), poll_url, throttle, send_page));
+            tasks.spawn(pages_to_pg(db.clone(), recv_page));
+            Some(db)
+        } else {
+            None
+        };
+
+        tasks.spawn(serve(upstream, wrap, listen_conf, experimental_conf, db));
+    }
 
     while let Some(next) = tasks.join_next().await {
         match next {

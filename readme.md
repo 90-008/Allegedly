@@ -15,6 +15,16 @@ Allegedly can
       --wrap-pg "postgresql://user:pass@pg-host:5432/plc-db"
     ```
 
+- Run a fully self-contained mirror using an embedded fjall database (no postgres needed):
+
+    ```bash
+    # backfill first
+    allegedly backfill --to-fjall ./plc-data
+
+    # then run the mirror
+    allegedly mirror --wrap-fjall ./plc-data
+    ```
+
 - Wrap a plc server, maximalist edition:
 
     ```bash
@@ -89,7 +99,7 @@ to install the latest from source:
 - [ ] experimental: websocket version of /export
 - [x] experimental: accept writes by forwarding them upstream
 - [ ] experimental: serve a tlog
-- [ ] experimental: embed a log database directly for fast and efficient mirroring
+- [x] experimental: embed a log database directly for fast and efficient mirroring
 - [ ] experimental: support multiple upstreams?
 
 - [ ] new command todo: `zip` or `check` or `diff`: compare two plc logs over some time range

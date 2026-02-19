@@ -1,7 +1,8 @@
 use allegedly::{
-    Db, Dt, ExportPage, FolderSource, HttpSource, backfill, backfill_to_pg,
+    Db, Dt, ExportPage, FjallDb, FolderSource, HttpSource, backfill, backfill_to_fjall,
+    backfill_to_pg,
     bin::{GlobalArgs, bin_init},
-    full_pages, logo, pages_to_pg, pages_to_stdout, poll_upstream,
+    full_pages, logo, pages_to_fjall, pages_to_pg, pages_to_stdout, poll_upstream,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -45,6 +46,16 @@ pub struct Args {
     /// only used if `--to-postgres` is present
     #[arg(long, action)]
     postgres_reset: bool,
+    /// Bulk load into a local fjall embedded database
+    ///
+    /// Pass a directory path for the fjall database
+    #[arg(long, conflicts_with_all = ["to_postgres", "postgres_cert", "postgres_reset"])]
+    to_fjall: Option<PathBuf>,
+    /// Delete all operations from the fjall db before starting
+    ///
+    /// only used if `--to-fjall` is present
+    #[arg(long, action, requires = "to_fjall")]
+    fjall_reset: bool,
     /// Stop at the week ending before this date
     #[arg(long)]
     until: Option<Dt>,
@@ -66,6 +77,8 @@ pub async fn run(
         to_postgres,
         postgres_cert,
         postgres_reset,
+        to_fjall,
+        fjall_reset,
         until,
         catch_up,
     }: Args,
@@ -143,7 +156,21 @@ pub async fn run(
         }
 
         // set up sinks
-        if let Some(pg_url) = to_postgres {
+        if let Some(fjall_path) = to_fjall {
+            log::trace!("opening fjall db at {fjall_path:?}...");
+            let db = FjallDb::open(&fjall_path)?;
+            log::trace!("opened fjall db");
+
+            tasks.spawn(backfill_to_fjall(
+                db.clone(),
+                fjall_reset,
+                bulk_out,
+                found_last_tx,
+            ));
+            if catch_up {
+                tasks.spawn(pages_to_fjall(db, full_out));
+            }
+        } else if let Some(pg_url) = to_postgres {
             log::trace!("connecting to postgres...");
             let db = Db::new(pg_url.as_str(), postgres_cert).await?;
             log::trace!("connected to postgres");
