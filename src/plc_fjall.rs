@@ -185,8 +185,7 @@ impl FjallDb {
 
     pub fn export_ops(&self, after: Option<Dt>, limit: usize) -> anyhow::Result<Vec<Op>> {
         let iter = if let Some(after) = after {
-            let next_micros = (after.timestamp_micros() as u64) + 1;
-            let start = next_micros.to_be_bytes();
+            let start = (after.timestamp_micros() as u64).to_be_bytes();
             self.inner.ops.range(start..)
         } else {
             self.inner.ops.iter()
