@@ -118,7 +118,15 @@ pub async fn run(
         let throttle = Duration::from_millis(upstream_throttle_ms);
         tasks.spawn(poll_upstream(None, upstream, throttle, poll_tx));
         tasks.spawn(full_pages(poll_out, full_tx));
-        tasks.spawn(pages_to_stdout(full_out, None));
+        if let Some(fjall_path) = to_fjall {
+            log::trace!("opening fjall db at {fjall_path:?}...");
+            let db = FjallDb::open(&fjall_path)?;
+            log::trace!("opened fjall db");
+
+            tasks.spawn(pages_to_fjall(db, full_out));
+        } else {
+            tasks.spawn(pages_to_stdout(full_out, None));
+        }
     } else {
         // fun mode
 
