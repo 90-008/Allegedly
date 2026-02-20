@@ -93,9 +93,16 @@ struct FjallInner {
 
 impl FjallDb {
     pub fn open(path: impl AsRef<Path>) -> fjall::Result<Self> {
-        let db = Database::builder(path).open()?;
-        let ops = db.keyspace("ops", KeyspaceCreateOptions::default)?;
-        let by_did = db.keyspace("by_did", KeyspaceCreateOptions::default)?;
+        let db = Database::builder(path)
+            .max_journaling_size(/* 1 GiB */ 1_024 * 1_024 * 1_024)
+            .open()?;
+        let opts = KeyspaceCreateOptions::default;
+        let ops = db.keyspace("ops", || {
+            opts().max_memtable_size(/* 256 MiB */ 256 * 1_024 * 1_024)
+        })?;
+        let by_did = db.keyspace("by_did", || {
+            opts().max_memtable_size(/* 128 MiB */ 128 * 1_024 * 1_024)
+        })?;
         Ok(Self {
             inner: Arc::new(FjallInner { db, ops, by_did }),
         })
