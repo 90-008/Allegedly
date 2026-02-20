@@ -39,6 +39,11 @@ fn decode_cid(bytes: &[u8]) -> anyhow::Result<String> {
         .map(|cid| cid.to_string())
 }
 
+fn decode_did(bytes: &[u8]) -> String {
+    let decoded = BASE32_NOPAD.encode(bytes).to_lowercase();
+    format!("did:plc:{decoded}")
+}
+
 fn op_key(created_at: &Dt, cid: &str) -> anyhow::Result<Vec<u8>> {
     let micros = created_at.timestamp_micros() as u64;
     let mut key = Vec::with_capacity(8 + 1 + cid.len());
@@ -55,8 +60,11 @@ fn by_did_prefix(did: &str) -> anyhow::Result<Vec<u8>> {
     Ok(p)
 }
 
-fn by_did_key(did: &str, cid: &str) -> anyhow::Result<Vec<u8>> {
+fn by_did_key(did: &str, created_at: &Dt, cid: &str) -> anyhow::Result<Vec<u8>> {
     let mut key = by_did_prefix(did)?;
+    let micros = created_at.timestamp_micros() as u64;
+    key.extend_from_slice(&micros.to_be_bytes());
+    key.push(SEP);
     encode_cid(&mut key, cid)?;
     Ok(key)
 }
@@ -75,7 +83,8 @@ fn decode_timestamp(key: &[u8]) -> anyhow::Result<Dt> {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DbOp {
-    pub did: String,
+    #[serde(with = "serde_bytes")]
+    pub did: Vec<u8>,
     pub nullified: bool,
     pub operation: Box<serde_json::value::RawValue>,
 }
@@ -134,63 +143,76 @@ impl FjallDb {
     }
 
     pub fn insert_op(&self, batch: &mut OwnedWriteBatch, op: &Op) -> anyhow::Result<usize> {
-        let pk = by_did_key(&op.did, &op.cid)?;
+        let pk = by_did_key(&op.did, &op.created_at, &op.cid)?;
         if self.inner.by_did.get(&pk)?.is_some() {
             return Ok(0);
         }
         let ts_key = op_key(&op.created_at, &op.cid)?;
-        let value = serde_json::to_vec(op)?;
+
+        let mut encoded_did = Vec::with_capacity(15);
+        encode_did(&mut encoded_did, &op.did)?;
+
+        let db_op = DbOp {
+            did: encoded_did,
+            nullified: op.nullified,
+            operation: op.operation.clone(),
+        };
+        let value = rmp_serde::to_vec_named(&db_op)?;
         batch.insert(&self.inner.ops, &ts_key, &value);
-        batch.insert(
-            &self.inner.by_did,
-            &pk,
-            &op.created_at.timestamp_micros().to_be_bytes(),
-        );
+        batch.insert(&self.inner.by_did, &pk, &[]);
         Ok(1)
     }
 
-    pub fn ops_for_did(&self, did: &str) -> anyhow::Result<Vec<Op>> {
+    pub fn ops_for_did(
+        &self,
+        did: &str,
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Op>> + '_> {
         let prefix = by_did_prefix(did)?;
 
-        let mut entries: Vec<(Dt, Vec<u8>)> = Vec::new();
-        for guard in self.inner.by_did.prefix(&prefix) {
-            let (by_did_key, ts_bytes) = guard
+        Ok(self.inner.by_did.prefix(&prefix).map(move |guard| {
+            let (by_did_key, _) = guard
                 .into_inner()
                 .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
-            // construct op key from timestamp and cid
-            let cid_bytes = by_did_key
+
+            let key_rest = by_did_key
                 .get(prefix.len()..)
                 .ok_or_else(|| anyhow::anyhow!("invalid by_did key {by_did_key:?}"))?;
-            let op_key = [ts_bytes.as_ref(), &[SEP], cid_bytes].concat();
-            entries.push((decode_timestamp(&ts_bytes)?, op_key));
-        }
 
-        entries.sort_by_key(|(ts, _)| *ts);
+            let ts_bytes = key_rest
+                .get(..8)
+                .ok_or_else(|| anyhow::anyhow!("invalid length"))?;
+            let cid_bytes = key_rest
+                .get(9..)
+                .ok_or_else(|| anyhow::anyhow!("invalid length"))?;
 
-        let mut ops = Vec::with_capacity(entries.len());
-        for (ts, op_key) in entries {
-            let Some(value) = self.inner.ops.get(&op_key)? else {
-                anyhow::bail!("op not found in db: {op_key:?}");
-            };
-            let op: DbOp = serde_json::from_slice(&value)?;
-            let cid = decode_cid(
-                op_key
-                    .get(9..)
-                    .ok_or_else(|| anyhow::anyhow!("invalid op key {op_key:?}"))?,
-            )?;
-            let op = Op {
-                did: op.did,
+            let op_key = [ts_bytes, &[SEP][..], cid_bytes].concat();
+            let ts = decode_timestamp(ts_bytes)?;
+
+            let value = self
+                .inner
+                .ops
+                .get(&op_key)?
+                .ok_or_else(|| anyhow::anyhow!("op not found: {op_key:?}"))?;
+
+            let op: DbOp = rmp_serde::from_slice(&value)?;
+            let cid = decode_cid(cid_bytes)?;
+            let did = decode_did(&op.did);
+
+            Ok(Op {
+                did,
                 cid,
                 created_at: ts,
                 nullified: op.nullified,
                 operation: op.operation,
-            };
-            ops.push(op);
-        }
-        Ok(ops)
+            })
+        }))
     }
 
-    pub fn export_ops(&self, after: Option<Dt>, limit: usize) -> anyhow::Result<Vec<Op>> {
+    pub fn export_ops(
+        &self,
+        after: Option<Dt>,
+        limit: usize,
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Op>> + '_> {
         let iter = if let Some(after) = after {
             let start = (after.timestamp_micros() as u64).to_be_bytes();
             self.inner.ops.range(start..)
@@ -198,12 +220,11 @@ impl FjallDb {
             self.inner.ops.iter()
         };
 
-        let mut ops = Vec::with_capacity(limit);
-        for item in iter.take(limit) {
+        Ok(iter.take(limit).map(|item| {
             let (key, value) = item
                 .into_inner()
                 .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
-            let op: DbOp = serde_json::from_slice(&value)?;
+            let db_op: DbOp = rmp_serde::from_slice(&value)?;
             let created_at = decode_timestamp(
                 key.get(..8)
                     .ok_or_else(|| anyhow::anyhow!("invalid op key {key:?}"))?,
@@ -212,16 +233,16 @@ impl FjallDb {
                 key.get(9..)
                     .ok_or_else(|| anyhow::anyhow!("invalid op key {key:?}"))?,
             )?;
-            let op = Op {
-                did: op.did,
+            let did = decode_did(&db_op.did);
+
+            Ok(Op {
+                did,
                 cid,
                 created_at,
-                nullified: op.nullified,
-                operation: op.operation,
-            };
-            ops.push(op);
-        }
-        Ok(ops)
+                nullified: db_op.nullified,
+                operation: db_op.operation,
+            })
+        }))
     }
 }
 

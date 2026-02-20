@@ -145,10 +145,13 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
 
     let did = did.to_string();
     let db = state.fjall.clone();
-    let ops = tokio::task::spawn_blocking(move || db.ops_for_did(&did))
-        .await
-        .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-        .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
+    let ops = tokio::task::spawn_blocking(move || {
+        let iter = db.ops_for_did(&did)?;
+        iter.collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
+    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
 
     if ops.is_empty() {
         return Err(Error::from_string(
@@ -164,14 +167,12 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
 
     match sub_path {
         "" => {
-            let op_values: Vec<serde_json::Value> = ops
+            let parsed: Vec<serde_json::Value> = ops
                 .iter()
                 .filter(|op| !op.nullified)
                 .filter_map(|op| serde_json::from_str(op.operation.get()).ok())
                 .collect();
-
-            let last_op = op_values.last();
-            let data = last_op.and_then(|op| doc::op_to_doc_data(did_str, op));
+            let data = doc::apply_op_log(did_str, &parsed);
             let Some(data) = data else {
                 return Err(Error::from_string(
                     format!("DID not available: {did_str}"),
@@ -226,14 +227,12 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
                 .body(serde_json::to_string(&last).unwrap()))
         }
         "/data" => {
-            let op_values: Vec<serde_json::Value> = ops
+            let parsed: Vec<serde_json::Value> = ops
                 .iter()
                 .filter(|op| !op.nullified)
                 .filter_map(|op| serde_json::from_str(op.operation.get()).ok())
                 .collect();
-
-            let last_op = op_values.last();
-            let data = last_op.and_then(|op| doc::op_to_doc_data(did_str, op));
+            let data = doc::apply_op_log(did_str, &parsed);
             let Some(data) = data else {
                 return Err(Error::from_string(
                     format!("DID not available: {did_str}"),
@@ -274,10 +273,13 @@ async fn fjall_export(
     let limit = 1000;
     let db = fjall.clone();
 
-    let ops = tokio::task::spawn_blocking(move || db.export_ops(after, limit))
-        .await
-        .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-        .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
+    let ops = tokio::task::spawn_blocking(move || {
+        let iter = db.export_ops(after, limit)?;
+        iter.collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
+    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
 
     let stream = futures::stream::iter(ops).map(|op| {
         let mut json = serde_json::to_string(&op).unwrap();
