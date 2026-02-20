@@ -206,9 +206,14 @@ pub fn op_to_doc_data<'a>(did: &'a str, op: &'a Value) -> Option<DocumentData<'a
 
 /// apply a sequence of operation JSON blobs and return the current document data.
 /// returns None if the DID is tombstoned (last op is a tombstone).
-pub fn apply_op_log<'a>(did: &'a str, ops: &'a [Value]) -> Option<DocumentData<'a>> {
+pub fn apply_op_log<'a>(
+    did: &'a str,
+    ops: impl IntoIterator<Item = &'a Value>,
+) -> Option<DocumentData<'a>> {
     // TODO: we don't verify signature chain, we should do that...
-    ops.last().and_then(|op| op_to_doc_data(did, op))
+    ops.into_iter()
+        .last()
+        .and_then(|op| op_to_doc_data(did, op))
 }
 
 #[cfg(test)]
