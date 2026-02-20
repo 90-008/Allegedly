@@ -139,27 +139,42 @@ impl PageBoundaryState {
 ///
 /// Extracts the final op so it can be used to fetch the following page
 pub async fn get_page(url: Url) -> Result<(ExportPage, Option<LastOp>), GetPageError> {
+    use futures::TryStreamExt;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
     log::trace!("Getting page: {url}");
 
-    let ops: Vec<Op> = CLIENT
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?
-        .trim()
-        .split('\n')
-        .filter_map(|s| {
-            serde_json::from_str::<Op>(s)
-                .inspect_err(|e| {
-                    if !s.is_empty() {
-                        log::warn!("failed to parse op: {e} ({s})")
-                    }
-                })
-                .ok()
-        })
-        .collect();
+    let res = CLIENT.get(url).send().await?.error_for_status()?;
+    let stream = Box::pin(
+        res.bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .into_async_read()
+            .compat(),
+    );
+
+    let mut lines = BufReader::new(stream).lines();
+    let mut ops = Vec::new();
+
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Op>(line) {
+                    Ok(op) => ops.push(op),
+                    Err(e) => log::warn!("failed to parse op: {e} ({line})"),
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("transport error mid-page: {}; returning partial page", e);
+                break;
+            }
+        }
+    }
 
     let last_op = ops.last().map(Into::into);
 
@@ -214,7 +229,14 @@ pub async fn poll_upstream(
                 .append_pair("after", &pl.created_at.to_rfc3339());
         };
 
-        let (mut page, next_last) = get_page(url).await?;
+        let (mut page, next_last) = match get_page(url).await {
+            Ok(res) => res,
+            Err(e) => {
+                log::warn!("error polling upstream: {e}");
+                continue;
+            }
+        };
+
         if let Some(ref mut state) = boundary_state {
             state.apply_to_next(&mut page);
         } else {

@@ -197,30 +197,62 @@ pub async fn week_to_pages(
     dest: mpsc::Sender<ExportPage>,
 ) -> anyhow::Result<()> {
     use futures::TryStreamExt;
-    let reader = source
-        .reader_for(week)
-        .await
-        .inspect_err(|e| log::error!("week_to_pages reader failed: {e}"))?;
-    let decoder = GzipDecoder::new(BufReader::new(reader));
-    let mut chunks = pin!(LinesStream::new(BufReader::new(decoder).lines()).try_chunks(10000));
+    let mut retry_backoff = std::time::Duration::from_secs(2);
 
-    while let Some(chunk) = chunks
-        .try_next()
-        .await
-        .inspect_err(|e| log::error!("failed to get next chunk: {e}"))?
-    {
-        let ops: Vec<Op> = chunk
-            .into_iter()
-            .filter_map(|s| {
-                serde_json::from_str::<Op>(&s)
-                    .inspect_err(|e| log::warn!("failed to parse op: {e} ({s})"))
-                    .ok()
-            })
-            .collect();
-        let page = ExportPage { ops };
-        dest.send(page)
-            .await
-            .inspect_err(|e| log::error!("failed to send page: {e}"))?;
+    loop {
+        let reader = match source.reader_for(week).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "week_to_pages reader_for failed {e}, retrying in {}s",
+                    retry_backoff.as_secs()
+                );
+                tokio::time::sleep(retry_backoff).await;
+                retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(300));
+                continue;
+            }
+        };
+
+        let decoder = GzipDecoder::new(BufReader::new(reader));
+        let mut chunks = pin!(LinesStream::new(BufReader::new(decoder).lines()).try_chunks(10000));
+        let mut success = true;
+
+        while let Some(chunk) = match chunks.as_mut().try_next().await {
+            Ok(Some(c)) => Some(c),
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!(
+                    "failed to get next chunk: {e}, retrying week in {}s",
+                    retry_backoff.as_secs()
+                );
+                tokio::time::sleep(retry_backoff).await;
+                retry_backoff = (retry_backoff * 2).min(std::time::Duration::from_secs(300));
+                success = false;
+                None
+            }
+        } {
+            let ops: Vec<Op> = chunk
+                .into_iter()
+                .filter_map(|s| {
+                    serde_json::from_str::<Op>(&s)
+                        .inspect_err(|e| log::warn!("failed to parse op: {e} ({s})"))
+                        .ok()
+                })
+                .collect();
+
+            if ops.is_empty() {
+                continue;
+            }
+
+            let page = ExportPage { ops };
+            if let Err(e) = dest.send(page).await {
+                log::error!("failed to send page (receiver closed): {e}");
+                return Err(e.into());
+            }
+        }
+
+        if success {
+            return Ok(());
+        }
     }
-    Ok(())
 }
