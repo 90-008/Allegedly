@@ -1,5 +1,5 @@
 use crate::{Dt, ExportPage, Op as CommonOp, PageBoundaryState};
-use data_encoding::{BASE32_NOPAD, BASE64URL};
+use data_encoding::{BASE32_NOPAD, BASE64URL, BASE64URL_NOPAD};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -86,16 +86,16 @@ struct Signature(#[serde(with = "serde_bytes")] Vec<u8>);
 
 impl Signature {
     fn from_base64url(s: &str) -> anyhow::Result<Self> {
-        BASE64URL
+        BASE64URL_NOPAD
             .decode(s.as_bytes())
             .map(Self)
-            .map_err(|e| anyhow::anyhow!("invalid base64url sig: {e}"))
+            .map_err(|e| anyhow::anyhow!("invalid base64url sig {s}: {e}"))
     }
 }
 
 impl fmt::Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&BASE64URL.encode(&self.0))
+        f.write_str(&BASE64URL_NOPAD.encode(&self.0))
     }
 }
 
