@@ -167,12 +167,12 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
 
     match sub_path {
         "" => {
-            let parsed: Vec<serde_json::Value> = ops
-                .iter()
-                .filter(|op| !op.nullified)
-                .filter_map(|op| serde_json::from_str(op.operation.get()).ok())
-                .collect();
-            let data = doc::apply_op_log(did_str, &parsed);
+            let data = doc::apply_op_log(
+                did_str,
+                ops.iter()
+                    .filter(|op| !op.nullified)
+                    .map(|op| &op.operation),
+            );
             let Some(data) = data else {
                 return Err(Error::from_string(
                     format!("DID not available: {did_str}"),
@@ -185,10 +185,10 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
                 .body(serde_json::to_string(&doc).unwrap()))
         }
         "/log" => {
-            let log: Vec<serde_json::Value> = ops
+            let log: Vec<&serde_json::Value> = ops
                 .iter()
                 .filter(|op| !op.nullified)
-                .filter_map(|op| serde_json::from_str(op.operation.get()).ok())
+                .map(|op| &op.operation)
                 .collect();
             Ok(Response::builder()
                 .content_type("application/json")
@@ -200,7 +200,7 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
                 .map(|op| {
                     serde_json::json!({
                         "did": op.did,
-                        "operation": serde_json::from_str::<serde_json::Value>(op.operation.get()).unwrap_or_default(),
+                        "operation": op.operation,
                         "cid": op.cid,
                         "nullified": op.nullified,
                         "createdAt": op.created_at.to_rfc3339(),
@@ -212,10 +212,11 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
                 .body(serde_json::to_string(&audit).unwrap()))
         }
         "/log/last" => {
-            let last =
-                ops.iter().filter(|op| !op.nullified).last().and_then(|op| {
-                    serde_json::from_str::<serde_json::Value>(op.operation.get()).ok()
-                });
+            let last = ops
+                .iter()
+                .filter(|op| !op.nullified)
+                .last()
+                .map(|op| &op.operation);
             let Some(last) = last else {
                 return Err(Error::from_string(
                     format!("DID not available: {did_str}"),
@@ -227,12 +228,12 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
                 .body(serde_json::to_string(&last).unwrap()))
         }
         "/data" => {
-            let parsed: Vec<serde_json::Value> = ops
-                .iter()
-                .filter(|op| !op.nullified)
-                .filter_map(|op| serde_json::from_str(op.operation.get()).ok())
-                .collect();
-            let data = doc::apply_op_log(did_str, &parsed);
+            let data = doc::apply_op_log(
+                did_str,
+                ops.iter()
+                    .filter(|op| !op.nullified)
+                    .map(|op| &op.operation),
+            );
             let Some(data) = data else {
                 return Err(Error::from_string(
                     format!("DID not available: {did_str}"),

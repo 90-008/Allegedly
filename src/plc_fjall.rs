@@ -1,4 +1,4 @@
-use crate::{Dt, ExportPage, Op, PageBoundaryState};
+use crate::{Dt, ExportPage, Op as CommonOp, PageBoundaryState};
 use data_encoding::BASE32_NOPAD;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,16 @@ fn decode_timestamp(key: &[u8]) -> anyhow::Result<Dt> {
         .ok_or_else(|| anyhow::anyhow!("invalid timestamp {micros}"))
 }
 
+// we have our own Op struct for fjall since we dont want to have to convert Value back to RawValue
+#[derive(Debug, Serialize)]
+pub struct Op {
+    pub did: String,
+    pub cid: String,
+    pub created_at: Dt,
+    pub nullified: bool,
+    pub operation: serde_json::Value,
+}
+
 // this is basically Op, but without the cid and created_at fields
 // since we have them in the key already
 #[derive(Debug, Deserialize, Serialize)]
@@ -86,7 +96,7 @@ struct DbOp {
     #[serde(with = "serde_bytes")]
     pub did: Vec<u8>,
     pub nullified: bool,
-    pub operation: Box<serde_json::value::RawValue>,
+    pub operation: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -142,7 +152,7 @@ impl FjallDb {
             .map(Some)
     }
 
-    pub fn insert_op(&self, batch: &mut OwnedWriteBatch, op: &Op) -> anyhow::Result<usize> {
+    pub fn insert_op(&self, batch: &mut OwnedWriteBatch, op: &CommonOp) -> anyhow::Result<usize> {
         let pk = by_did_key(&op.did, &op.created_at, &op.cid)?;
         if self.inner.by_did.get(&pk)?.is_some() {
             return Ok(0);
@@ -155,9 +165,9 @@ impl FjallDb {
         let db_op = DbOp {
             did: encoded_did,
             nullified: op.nullified,
-            operation: op.operation.clone(),
+            operation: serde_json::to_value(&op.operation)?,
         };
-        let value = rmp_serde::to_vec_named(&db_op)?;
+        let value = rmp_serde::to_vec(&db_op)?;
         batch.insert(&self.inner.ops, &ts_key, &value);
         batch.insert(&self.inner.by_did, &pk, &[]);
         Ok(1)
@@ -180,10 +190,10 @@ impl FjallDb {
 
             let ts_bytes = key_rest
                 .get(..8)
-                .ok_or_else(|| anyhow::anyhow!("invalid length"))?;
+                .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
             let cid_bytes = key_rest
                 .get(9..)
-                .ok_or_else(|| anyhow::anyhow!("invalid length"))?;
+                .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
 
             let op_key = [ts_bytes, &[SEP][..], cid_bytes].concat();
             let ts = decode_timestamp(ts_bytes)?;
