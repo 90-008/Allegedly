@@ -35,6 +35,7 @@ dependencies = [
  "governor",
  "http-body-util",
  "log",
+ "multibase",
  "native-tls",
  "opentelemetry",
  "opentelemetry-otlp",
