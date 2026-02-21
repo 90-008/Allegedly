@@ -117,6 +117,7 @@ pub async fn run(
         let latest = db
             .get_latest()?
             .expect("there to be at least one op in the db. did you backfill?");
+        log::debug!("starting polling from {latest}...");
 
         let (send_page, recv_page) = mpsc::channel(8);
 
@@ -144,6 +145,7 @@ pub async fn run(
                 .get_latest()
                 .await?
                 .expect("there to be at least one op in the db. did you backfill?");
+            log::debug!("starting polling from {latest}...");
 
             let (send_page, recv_page) = mpsc::channel(8);
 
