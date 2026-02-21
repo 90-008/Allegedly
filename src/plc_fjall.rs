@@ -137,6 +137,12 @@ impl FjallDb {
         self.inner.db.persist(PersistMode::SyncAll)
     }
 
+    pub fn compact(&self) -> fjall::Result<()> {
+        self.inner.ops.major_compact()?;
+        self.inner.by_did.major_compact()?;
+        Ok(())
+    }
+
     pub fn get_latest(&self) -> anyhow::Result<Option<Dt>> {
         let Some(guard) = self.inner.ops.last_key_value() else {
             return Ok(None);

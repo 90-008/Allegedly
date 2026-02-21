@@ -22,6 +22,13 @@ pub struct Args {
     /// path to a local fjall database directory (alternative to postgres)
     #[arg(long, env = "ALLEGEDLY_WRAP_FJALL", conflicts_with_all = ["wrap_pg", "wrap_pg_cert"])]
     wrap_fjall: Option<PathBuf>,
+    /// compact the fjall db on startup
+    #[arg(
+        long,
+        env = "ALLEGEDLY_FJALL_COMPACT",
+        conflicts_with_all = ["wrap_pg", "wrap_pg_cert"]
+    )]
+    compact_fjall: bool,
     /// wrapping server listen address
     #[arg(short, long, env = "ALLEGEDLY_BIND")]
     #[clap(default_value = "127.0.0.1:8000")]
@@ -74,6 +81,7 @@ pub async fn run(
         wrap_pg,
         wrap_pg_cert,
         wrap_fjall,
+        compact_fjall,
         bind,
         acme_domain,
         acme_cache_path,
@@ -112,12 +120,16 @@ pub async fn run(
 
     if let Some(fjall_path) = wrap_fjall {
         let db = FjallDb::open(&fjall_path)?;
+        if compact_fjall {
+            log::info!("compacting fjall...");
+            db.compact()?; // blocking here is fine, we didn't start anything yet
+        }
 
         log::debug!("getting the latest op from fjall...");
         let latest = db
             .get_latest()?
             .expect("there to be at least one op in the db. did you backfill?");
-        log::debug!("starting polling from {latest}...");
+        log::info!("starting polling from {latest}...");
 
         let (send_page, recv_page) = mpsc::channel(8);
 
