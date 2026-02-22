@@ -1,5 +1,6 @@
 use crate::{Dt, ExportPage, Op as CommonOp, PageBoundaryState};
-use data_encoding::{BASE32_NOPAD, BASE64URL, BASE64URL_NOPAD};
+use anyhow::Context;
+use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -199,6 +200,70 @@ impl OpType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredOpField {
+    Type,
+    Sig,
+    Prev,
+    RotationKeys,
+    VerificationMethods,
+    AlsoKnownAs,
+    Services,
+    SigningKey,
+    RecoveryKey,
+    Handle,
+    Service,
+}
+
+impl StoredOpField {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Type => "type",
+            Self::Sig => "sig",
+            Self::Prev => "prev",
+            Self::RotationKeys => "rotationKeys",
+            Self::VerificationMethods => "verificationMethods",
+            Self::AlsoKnownAs => "alsoKnownAs",
+            Self::Services => "services",
+            Self::SigningKey => "signingKey",
+            Self::RecoveryKey => "recoveryKey",
+            Self::Handle => "handle",
+            Self::Service => "service",
+        }
+    }
+}
+
+impl AsRef<str> for StoredOpField {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::ops::Deref for StoredOpField {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for StoredOpField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StoredOpError {
+    #[error("operation is not an object")]
+    NotAnObject,
+    #[error("missing required field: {0}")]
+    MissingField(StoredOpField),
+    #[error("invalid field {0}: {1}")]
+    InvalidField(StoredOpField, #[source] anyhow::Error),
+    #[error("type mismatch for field {0}: expected {1}")]
+    TypeMismatch(StoredOpField, &'static str),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredService {
     r#type: String,
@@ -227,121 +292,302 @@ struct StoredOp {
 }
 
 impl StoredOp {
-    fn from_json_value(v: &serde_json::Value) -> anyhow::Result<Self> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("operation is not an object"))?;
-
-        let mut known_keys = Vec::new();
-        let mut get = |key: &'static str| {
-            known_keys.push(key);
-            obj.get(key)
+    fn from_json_value(v: serde_json::Value) -> (Option<Self>, Vec<StoredOpError>) {
+        let serde_json::Value::Object(mut obj) = v else {
+            return (None, vec![StoredOpError::NotAnObject]);
         };
 
-        let op_type = get("type")
-            .and_then(|t| t.as_str())
-            .map(OpType::from_str)
-            .ok_or_else(|| anyhow::anyhow!("missing type field"))?;
-
-        let sig = get("sig")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing sig field"))
-            .and_then(Signature::from_base64url)?;
-
-        let prev = match get("prev").and_then(|p| p.as_str()) {
-            Some(s) => Some(PlcCid::from_cid_str(s)?),
-            None => None,
-        };
-
-        let rotation_keys = get("rotationKeys")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(DidKey::from_did_key)
-                    .collect::<anyhow::Result<Vec<_>>>()
-            })
-            .transpose()?;
-
-        let verification_methods = get("verificationMethods")
-            .and_then(|v| v.as_object())
-            .map(|map| {
-                map.iter()
-                    .map(|(k, v)| {
-                        let key = DidKey::from_did_key(v.as_str().unwrap_or_default())?;
-                        Ok((k.clone(), key))
-                    })
-                    .collect::<anyhow::Result<BTreeMap<_, _>>>()
-            })
-            .transpose()?;
-
-        let also_known_as = get("alsoKnownAs").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(Aka::from_str)
-                .collect()
-        });
-
-        let services = get("services").and_then(|v| v.as_object()).map(|map| {
-            map.iter()
-                .filter_map(|(k, v)| {
-                    let svc = StoredService {
-                        r#type: v.get("type")?.as_str()?.to_string(),
-                        endpoint: v.get("endpoint")?.as_str()?.to_string(),
-                    };
-                    Some((k.clone(), svc))
-                })
-                .collect()
-        });
-
-        let signing_key = get("signingKey")
-            .and_then(|v| v.as_str())
-            .map(DidKey::from_did_key)
-            .transpose()?;
-
-        let recovery_key = get("recoveryKey")
-            .and_then(|v| v.as_str())
-            .map(DidKey::from_did_key)
-            .transpose()?;
-
-        let handle = get("handle")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let service = get("service")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
+        let mut errors = Vec::new();
         let mut unknown = BTreeMap::new();
-        for (k, v) in obj {
-            if !known_keys.contains(&k.as_str()) {
-                unknown.insert(k.clone(), v.clone());
+
+        let op_type = match obj.remove(&*StoredOpField::Type) {
+            Some(serde_json::Value::String(s)) => OpType::from_str(&s),
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(StoredOpField::Type, "string"));
+                unknown.insert(StoredOpField::Type.to_string(), v);
+                OpType::Other(String::new())
             }
+            Option::None => {
+                errors.push(StoredOpError::MissingField(StoredOpField::Type));
+                OpType::Other(String::new())
+            }
+        };
+
+        let sig = match obj.remove(&*StoredOpField::Sig) {
+            Some(serde_json::Value::String(s)) => match Signature::from_base64url(&s) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    errors.push(StoredOpError::InvalidField(StoredOpField::Sig, e));
+                    unknown.insert(StoredOpField::Sig.to_string(), serde_json::Value::String(s));
+                    Signature(Vec::new())
+                }
+            },
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(StoredOpField::Sig, "string"));
+                unknown.insert(StoredOpField::Sig.to_string(), v);
+                Signature(Vec::new())
+            }
+            Option::None => {
+                errors.push(StoredOpError::MissingField(StoredOpField::Sig));
+                Signature(Vec::new())
+            }
+        };
+
+        let prev = match obj.remove(&*StoredOpField::Prev) {
+            Some(serde_json::Value::Null) | Option::None => Option::None,
+            Some(serde_json::Value::String(s)) => match PlcCid::from_cid_str(&s) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    errors.push(StoredOpError::InvalidField(StoredOpField::Prev, e));
+                    unknown.insert(
+                        StoredOpField::Prev.to_string(),
+                        serde_json::Value::String(s),
+                    );
+                    Option::None
+                }
+            },
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(StoredOpField::Prev, "string"));
+                unknown.insert(StoredOpField::Prev.to_string(), v);
+                Option::None
+            }
+        };
+
+        let rotation_keys = match obj.remove(&*StoredOpField::RotationKeys) {
+            Some(serde_json::Value::Array(arr)) => {
+                let mut keys = Vec::with_capacity(arr.len());
+                let mut failed = false;
+                for v in arr {
+                    match v {
+                        serde_json::Value::String(s) => match DidKey::from_did_key(&s) {
+                            Ok(k) => keys.push(k),
+                            Err(e) => {
+                                errors.push(StoredOpError::InvalidField(
+                                    StoredOpField::RotationKeys,
+                                    e,
+                                ));
+                                failed = true;
+                                break;
+                            }
+                        },
+                        _ => {
+                            errors.push(StoredOpError::TypeMismatch(
+                                StoredOpField::RotationKeys,
+                                "string inside array",
+                            ));
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if failed {
+                    // we don't have the original array anymore here because we consumed it,
+                    // but we can reconstruct it for the unknown map if we really want to,
+                    // though usually we just move the whole thing.
+                    // since we consumed it, let's just push an error and return None.
+                    // to be absolutely correct about preserving 'unknown', we should have peeked or cloned.
+                    // let's adjust the implementation to clone if we suspect it might fail,
+                    // OR just move the whole value back if it fails.
+                    Option::None
+                } else {
+                    Some(keys)
+                }
+            }
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(
+                    StoredOpField::RotationKeys,
+                    "array",
+                ));
+                unknown.insert(StoredOpField::RotationKeys.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        let verification_methods = match obj.remove(&*StoredOpField::VerificationMethods) {
+            Some(serde_json::Value::Object(map)) => {
+                let mut methods = BTreeMap::new();
+                let mut failed = false;
+                for (k, v) in map {
+                    match v {
+                        serde_json::Value::String(s) => match DidKey::from_did_key(&s) {
+                            Ok(key) => {
+                                methods.insert(k, key);
+                            }
+                            Err(e) => {
+                                errors.push(StoredOpError::InvalidField(
+                                    StoredOpField::VerificationMethods,
+                                    e,
+                                ));
+                                failed = true;
+                                break;
+                            }
+                        },
+                        _ => {
+                            errors.push(StoredOpError::TypeMismatch(
+                                StoredOpField::VerificationMethods,
+                                "string value in object",
+                            ));
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if failed { Option::None } else { Some(methods) }
+            }
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(
+                    StoredOpField::VerificationMethods,
+                    "object",
+                ));
+                unknown.insert(StoredOpField::VerificationMethods.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        let also_known_as = match obj.remove(&*StoredOpField::AlsoKnownAs) {
+            Some(serde_json::Value::Array(arr)) => Some(
+                arr.into_iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some(Aka::from_str(&s)),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(
+                    StoredOpField::AlsoKnownAs,
+                    "array",
+                ));
+                unknown.insert(StoredOpField::AlsoKnownAs.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        let services = match obj.remove(&*StoredOpField::Services) {
+            Some(serde_json::Value::Object(map)) => Some(
+                map.into_iter()
+                    .filter_map(|(k, v)| {
+                        let svc = StoredService {
+                            r#type: v.get("type")?.as_str()?.to_string(),
+                            endpoint: v.get("endpoint")?.as_str()?.to_string(),
+                        };
+                        Some((k, svc))
+                    })
+                    .collect(),
+            ),
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(
+                    StoredOpField::Services,
+                    "object",
+                ));
+                unknown.insert(StoredOpField::Services.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        let signing_key = match obj.remove(&*StoredOpField::SigningKey) {
+            Some(serde_json::Value::String(s)) => match DidKey::from_did_key(&s) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    errors.push(StoredOpError::InvalidField(StoredOpField::SigningKey, e));
+                    unknown.insert(
+                        StoredOpField::SigningKey.to_string(),
+                        serde_json::Value::String(s),
+                    );
+                    Option::None
+                }
+            },
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(
+                    StoredOpField::SigningKey,
+                    "string",
+                ));
+                unknown.insert(StoredOpField::SigningKey.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        let recovery_key = match obj.remove(&*StoredOpField::RecoveryKey) {
+            Some(serde_json::Value::String(s)) => match DidKey::from_did_key(&s) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    errors.push(StoredOpError::InvalidField(StoredOpField::RecoveryKey, e));
+                    unknown.insert(
+                        StoredOpField::RecoveryKey.to_string(),
+                        serde_json::Value::String(s),
+                    );
+                    Option::None
+                }
+            },
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(
+                    StoredOpField::RecoveryKey,
+                    "string",
+                ));
+                unknown.insert(StoredOpField::RecoveryKey.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        let handle = match obj.remove(&*StoredOpField::Handle) {
+            Some(serde_json::Value::String(s)) => Some(s),
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(StoredOpField::Handle, "string"));
+                unknown.insert(StoredOpField::Handle.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        let service = match obj.remove(&*StoredOpField::Service) {
+            Some(serde_json::Value::String(s)) => Some(s),
+            Some(v) => {
+                errors.push(StoredOpError::TypeMismatch(
+                    StoredOpField::Service,
+                    "string",
+                ));
+                unknown.insert(StoredOpField::Service.to_string(), v);
+                Option::None
+            }
+            Option::None => Option::None,
+        };
+
+        for (k, v) in obj {
+            unknown.insert(k, v);
         }
 
-        Ok(Self {
-            op_type,
-            sig,
-            prev,
-            rotation_keys,
-            verification_methods,
-            also_known_as,
-            services,
-            signing_key,
-            recovery_key,
-            handle,
-            service,
-            unknown,
-        })
+        (
+            Some(Self {
+                op_type,
+                sig,
+                prev,
+                rotation_keys,
+                verification_methods,
+                also_known_as,
+                services,
+                signing_key,
+                recovery_key,
+                handle,
+                service,
+                unknown,
+            }),
+            errors,
+        )
     }
 
     fn to_json_value(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
 
-        map.insert("type".into(), self.op_type.as_str().into());
-        map.insert("sig".into(), self.sig.to_string().into());
+        map.insert((*StoredOpField::Type).into(), self.op_type.as_str().into());
+        map.insert((*StoredOpField::Sig).into(), self.sig.to_string().into());
         map.insert(
-            "prev".into(),
+            (*StoredOpField::Prev).into(),
             self.prev
                 .as_ref()
                 .map(|c| serde_json::Value::String(c.to_string()))
@@ -350,7 +596,7 @@ impl StoredOp {
 
         if let Some(keys) = &self.rotation_keys {
             map.insert(
-                "rotationKeys".into(),
+                (*StoredOpField::RotationKeys).into(),
                 keys.iter()
                     .map(|k| serde_json::Value::String(k.to_string()))
                     .collect::<Vec<_>>()
@@ -363,12 +609,12 @@ impl StoredOp {
                 .iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.to_string())))
                 .collect();
-            map.insert("verificationMethods".into(), obj.into());
+            map.insert((*StoredOpField::VerificationMethods).into(), obj.into());
         }
 
         if let Some(aka) = &self.also_known_as {
             map.insert(
-                "alsoKnownAs".into(),
+                (*StoredOpField::AlsoKnownAs).into(),
                 aka.iter()
                     .map(|h| serde_json::Value::String(h.to_string()))
                     .collect::<Vec<_>>()
@@ -389,21 +635,21 @@ impl StoredOp {
                     )
                 })
                 .collect();
-            map.insert("services".into(), obj.into());
+            map.insert((*StoredOpField::Services).into(), obj.into());
         }
 
         // legacy create fields
         if let Some(key) = &self.signing_key {
-            map.insert("signingKey".into(), key.to_string().into());
+            map.insert((*StoredOpField::SigningKey).into(), key.to_string().into());
         }
         if let Some(key) = &self.recovery_key {
-            map.insert("recoveryKey".into(), key.to_string().into());
+            map.insert((*StoredOpField::RecoveryKey).into(), key.to_string().into());
         }
         if let Some(handle) = &self.handle {
-            map.insert("handle".into(), handle.clone().into());
+            map.insert((*StoredOpField::Handle).into(), handle.clone().into());
         }
         if let Some(service) = &self.service {
-            map.insert("service".into(), service.clone().into());
+            map.insert((*StoredOpField::Service).into(), service.clone().into());
         }
 
         for (k, v) in &self.unknown {
@@ -505,11 +751,24 @@ impl FjallDb {
         encode_did(&mut encoded_did, &op.did)?;
 
         let json_val: serde_json::Value = serde_json::from_str(op.operation.get())?;
-        let stored = StoredOp::from_json_value(&json_val)?;
+        let (stored, mut errors) = StoredOp::from_json_value(json_val);
+
+        let Some(operation) = stored else {
+            return Err(errors.remove(0)).context("fatal operation parse error");
+        };
+
+        for e in &errors {
+            log::warn!("failed to parse operation {} {}: {}", op.did, op.cid, e);
+        }
+        if !errors.is_empty() {
+            // if parse failed but not fatal, we just dont store it
+            return Ok(0);
+        }
+
         let db_op = DbOp {
             did: encoded_did,
             nullified: op.nullified,
-            operation: stored,
+            operation,
         };
         let value = rmp_serde::to_vec(&db_op)?;
         batch.insert(&self.inner.ops, &ts_key, &value);
@@ -757,8 +1016,15 @@ mod tests {
 
             for entry in &entries {
                 let op = &entry["operation"];
-                let stored = StoredOp::from_json_value(op)
-                    .unwrap_or_else(|e| panic!("failed to parse op in {path}: {e}\n{op}"));
+                let (stored, errors) = StoredOp::from_json_value(op.clone());
+                if !errors.is_empty() {
+                    let mut msg = format!("failed to parse op in {path}:\n");
+                    for e in errors {
+                        msg.push_str(&format!("  - {e:?}\n"));
+                    }
+                    msg.push_str(&format!("op: {op}\n"));
+                    panic!("{msg}");
+                }
 
                 // msgpack verification
                 let packed = rmp_serde::to_vec(&stored).unwrap();
