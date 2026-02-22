@@ -1,7 +1,10 @@
 use crate::{Dt, ExportPage, Op as CommonOp, PageBoundaryState};
 use anyhow::Context;
 use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
+use fjall::{
+    Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode,
+    config::BlockSizePolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -694,15 +697,35 @@ struct FjallInner {
 
 impl FjallDb {
     pub fn open(path: impl AsRef<Path>) -> fjall::Result<Self> {
+        const fn kb(kb: u32) -> u32 {
+            kb * 1_024
+        }
+        const fn mb(mb: u32) -> u64 {
+            kb(mb) as u64 * 1_024
+        }
+
         let db = Database::builder(path)
-            .max_journaling_size(/* 1 GiB */ 1_024 * 1_024 * 1_024)
+            // 32mb is too low we can afford more
+            // this should be configurable though!
+            .cache_size(mb(256))
             .open()?;
         let opts = KeyspaceCreateOptions::default;
         let ops = db.keyspace("ops", || {
-            opts().max_memtable_size(/* 256 MiB */ 256 * 1_024 * 1_024)
+            opts()
+                // this is mainly for when backfilling
+                .max_memtable_size(mb(192))
+                // this wont compress terribly well since its a bunch of CIDs and signatures and did:keys
+                // and we want to keep reads fast since we'll be reading a lot...
+                .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(8), kb(32)]))
+                // this has no downsides, since the only point reads that might miss we do is on by_did
+                .expect_point_read_hits(true)
         })?;
         let by_did = db.keyspace("by_did", || {
-            opts().max_memtable_size(/* 128 MiB */ 128 * 1_024 * 1_024)
+            opts()
+                .max_memtable_size(mb(64))
+                // this isn't gonna compress well anyway, since its just keys (did + timestamp + cid)
+                // and dids dont have many operations in the first place, so we can use small blocks
+                .data_block_size_policy(BlockSizePolicy::all(kb(2)))
         })?;
         Ok(Self {
             inner: Arc::new(FjallInner { db, ops, by_did }),
@@ -946,6 +969,68 @@ pub async fn pages_to_fjall(
         t0.elapsed()
     );
     Ok("pages_to_fjall")
+}
+
+pub async fn fjall_to_pages(
+    db: FjallDb,
+    dest: mpsc::Sender<ExportPage>,
+    until: Option<Dt>,
+) -> anyhow::Result<&'static str> {
+    log::info!("starting fjall_to_pages backfill source...");
+
+    let t0 = Instant::now();
+
+    let dest_clone = dest.clone();
+    let ops_sent = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let iter = db.export_ops(None, usize::MAX)?;
+        let mut current_page = Vec::with_capacity(1000);
+        let mut count = 0;
+
+        for op_res in iter {
+            let op = op_res?;
+
+            if let Some(u) = until {
+                if op.created_at >= u {
+                    break;
+                }
+            }
+
+            let operation_str = serde_json::to_string(&op.operation)?;
+            let common_op = crate::Op {
+                did: op.did,
+                cid: op.cid,
+                created_at: op.created_at,
+                nullified: op.nullified,
+                operation: serde_json::value::RawValue::from_string(operation_str)?,
+            };
+
+            current_page.push(common_op);
+            count += 1;
+
+            if current_page.len() >= 1000 {
+                let page = ExportPage {
+                    ops: std::mem::take(&mut current_page),
+                };
+                if dest_clone.blocking_send(page).is_err() {
+                    break;
+                }
+            }
+        }
+
+        if !current_page.is_empty() {
+            let page = ExportPage { ops: current_page };
+            let _ = dest_clone.blocking_send(page);
+        }
+
+        Ok(count)
+    })
+    .await??;
+
+    log::info!(
+        "finished sending {ops_sent} ops from fjall in {:?}",
+        t0.elapsed()
+    );
+    Ok("fjall_to_pages")
 }
 
 #[cfg(test)]

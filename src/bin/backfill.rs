@@ -2,7 +2,7 @@ use allegedly::{
     Db, Dt, ExportPage, FjallDb, FolderSource, HttpSource, backfill, backfill_to_fjall,
     backfill_to_pg,
     bin::{GlobalArgs, bin_init},
-    full_pages, logo, pages_to_fjall, pages_to_pg, pages_to_stdout, poll_upstream,
+    fjall_to_pages, full_pages, logo, pages_to_fjall, pages_to_pg, pages_to_stdout, poll_upstream,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -23,6 +23,9 @@ pub struct Args {
     /// Local folder to fetch bundles from (overrides `http`)
     #[arg(long)]
     dir: Option<PathBuf>,
+    /// Local fjall database to fetch raw ops from (overrides `http` and `dir`)
+    #[arg(long, conflicts_with_all = ["dir"])]
+    from_fjall: Option<PathBuf>,
     /// Don't do weekly bulk-loading at all.
     ///
     /// overrides `http` and `dir`, makes catch_up redundant
@@ -72,6 +75,7 @@ pub async fn run(
     Args {
         http,
         dir,
+        from_fjall,
         no_bulk,
         source_workers,
         to_postgres,
@@ -131,7 +135,12 @@ pub async fn run(
         // fun mode
 
         // set up bulk sources
-        if let Some(dir) = dir {
+        if let Some(fjall_path) = from_fjall {
+            log::trace!("opening source fjall db at {fjall_path:?}...");
+            let db = FjallDb::open(&fjall_path)?;
+            log::trace!("opened source fjall db");
+            tasks.spawn(fjall_to_pages(db, bulk_tx, until));
+        } else if let Some(dir) = dir {
             if http != DEFAULT_HTTP.parse()? {
                 anyhow::bail!(
                     "non-default bulk http setting can't be used with bulk dir setting ({dir:?})"
