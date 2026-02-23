@@ -33,10 +33,12 @@ fn encode_did(buf: &mut Vec<u8>, did: &str) -> anyhow::Result<usize> {
 }
 
 // 59 bytes -> 36 bytes
-fn encode_cid(buf: &mut Vec<u8>, s: &str) -> anyhow::Result<usize> {
-    IpldCid::try_from(s)?
-        .write_bytes(buf)
-        .map_err(|e| anyhow::anyhow!("failed to encode cid {s}: {e}"))
+fn decode_cid_str(s: &str) -> anyhow::Result<Vec<u8>> {
+    let cid = IpldCid::try_from(s)?;
+    let mut buf = Vec::new();
+    cid.write_bytes(&mut buf)
+        .map_err(|e| anyhow::anyhow!("failed to encode cid {s}: {e}"))?;
+    Ok(buf)
 }
 
 fn decode_cid(bytes: &[u8]) -> anyhow::Result<String> {
@@ -50,13 +52,13 @@ fn decode_did(bytes: &[u8]) -> String {
     format!("did:plc:{decoded}")
 }
 
-fn op_key(created_at: &Dt, cid: &str) -> anyhow::Result<Vec<u8>> {
+fn op_key(created_at: &Dt, cid_suffix: &[u8]) -> Vec<u8> {
     let micros = created_at.timestamp_micros() as u64;
-    let mut key = Vec::with_capacity(8 + 1 + cid.len());
+    let mut key = Vec::with_capacity(8 + 1 + cid_suffix.len());
     key.extend_from_slice(&micros.to_be_bytes());
     key.push(SEP);
-    encode_cid(&mut key, cid)?;
-    Ok(key)
+    key.extend_from_slice(cid_suffix);
+    key
 }
 
 fn by_did_prefix(did: &str) -> anyhow::Result<Vec<u8>> {
@@ -66,12 +68,12 @@ fn by_did_prefix(did: &str) -> anyhow::Result<Vec<u8>> {
     Ok(p)
 }
 
-fn by_did_key(did: &str, created_at: &Dt, cid: &str) -> anyhow::Result<Vec<u8>> {
+fn by_did_key(did: &str, created_at: &Dt, cid_suffix: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut key = by_did_prefix(did)?;
     let micros = created_at.timestamp_micros() as u64;
     key.extend_from_slice(&micros.to_be_bytes());
     key.push(SEP);
-    encode_cid(&mut key, cid)?;
+    key.extend_from_slice(cid_suffix);
     Ok(key)
 }
 
@@ -785,6 +787,8 @@ impl StoredOp {
 struct DbOp {
     #[serde(with = "serde_bytes")]
     pub did: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub cid_prefix: Vec<u8>,
     pub nullified: bool,
     pub operation: StoredOp,
 }
@@ -879,11 +883,20 @@ impl FjallDb {
     }
 
     pub fn insert_op(&self, batch: &mut OwnedWriteBatch, op: &CommonOp) -> anyhow::Result<usize> {
-        let pk = by_did_key(&op.did, &op.created_at, &op.cid)?;
+        let cid_bytes = decode_cid_str(&op.cid)?;
+        let cid_prefix = cid_bytes
+            .get(..30)
+            .ok_or_else(|| anyhow::anyhow!("invalid cid length (prefix): {}", op.cid))?
+            .to_vec();
+        let cid_suffix = cid_bytes
+            .get(30..)
+            .ok_or_else(|| anyhow::anyhow!("invalid cid length (suffix): {}", op.cid))?;
+
+        let pk = by_did_key(&op.did, &op.created_at, cid_suffix)?;
         if self.inner.by_did.get(&pk)?.is_some() {
             return Ok(0);
         }
-        let ts_key = op_key(&op.created_at, &op.cid)?;
+        let ts_key = op_key(&op.created_at, cid_suffix);
 
         let mut encoded_did = Vec::with_capacity(15);
         encode_did(&mut encoded_did, &op.did)?;
@@ -905,6 +918,7 @@ impl FjallDb {
 
         let db_op = DbOp {
             did: encoded_did,
+            cid_prefix,
             nullified: op.nullified,
             operation,
         };
@@ -932,11 +946,11 @@ impl FjallDb {
             let ts_bytes = key_rest
                 .get(..8)
                 .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
-            let cid_bytes = key_rest
+            let cid_suffix = key_rest
                 .get(9..)
                 .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
 
-            let op_key = [ts_bytes, &[SEP][..], cid_bytes].concat();
+            let op_key = [ts_bytes, &[SEP][..], cid_suffix].concat();
             let ts = decode_timestamp(ts_bytes)?;
 
             let value = self
@@ -946,7 +960,10 @@ impl FjallDb {
                 .ok_or_else(|| anyhow::anyhow!("op not found: {op_key:?}"))?;
 
             let op: DbOp = rmp_serde::from_slice(&value)?;
-            let cid = decode_cid(cid_bytes)?;
+            let mut full_cid_bytes = op.cid_prefix.clone();
+            full_cid_bytes.extend_from_slice(cid_suffix);
+
+            let cid = decode_cid(&full_cid_bytes)?;
             let did = decode_did(&op.did);
 
             Ok(Op {
@@ -980,10 +997,14 @@ impl FjallDb {
                 key.get(..8)
                     .ok_or_else(|| anyhow::anyhow!("invalid op key {key:?}"))?,
             )?;
-            let cid = decode_cid(
-                key.get(9..)
-                    .ok_or_else(|| anyhow::anyhow!("invalid op key {key:?}"))?,
-            )?;
+            let cid_suffix = key
+                .get(9..)
+                .ok_or_else(|| anyhow::anyhow!("invalid op key {key:?}"))?;
+
+            let mut full_cid_bytes = db_op.cid_prefix.clone();
+            full_cid_bytes.extend_from_slice(cid_suffix);
+
+            let cid = decode_cid(&full_cid_bytes)?;
             let did = decode_did(&db_op.did);
 
             Ok(Op {
