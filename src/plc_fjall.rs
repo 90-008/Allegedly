@@ -151,6 +151,7 @@ impl fmt::Display for PlcCid {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 enum Aka {
+    Bluesky(String),
     Atproto(String),
     Other(String),
 }
@@ -158,7 +159,11 @@ enum Aka {
 impl Aka {
     fn from_str(s: &str) -> Self {
         if let Some(stripped) = s.strip_prefix("at://") {
-            Self::Atproto(stripped.to_string())
+            if let Some(handle) = stripped.strip_suffix(".bsky.social") {
+                Self::Bluesky(handle.to_string())
+            } else {
+                Self::Atproto(stripped.to_string())
+            }
         } else {
             Self::Other(s.to_string())
         }
@@ -168,6 +173,7 @@ impl Aka {
 impl fmt::Display for Aka {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Bluesky(h) => write!(f, "at://{h}.bsky.social"),
             Self::Atproto(h) => write!(f, "at://{h}"),
             Self::Other(s) => f.write_str(s),
         }
@@ -267,10 +273,114 @@ enum StoredOpError {
     TypeMismatch(StoredOpField, &'static str),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+enum VerificationMethodKey {
+    Atproto,
+    Other(String),
+}
+
+impl VerificationMethodKey {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "atproto" => Self::Atproto,
+            _ => Self::Other(s.to_string()),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Atproto => "atproto",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl fmt::Display for VerificationMethodKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+enum ServiceKey {
+    AtprotoPds,
+    Other(String),
+}
+
+impl ServiceKey {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "atproto_pds" => Self::AtprotoPds,
+            _ => Self::Other(s.to_string()),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::AtprotoPds => "atproto_pds",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl fmt::Display for ServiceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum ServiceType {
+    AtprotoPersonalDataServer,
+    Other(String),
+}
+
+impl ServiceType {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "AtprotoPersonalDataServer" => Self::AtprotoPersonalDataServer,
+            _ => Self::Other(s.to_string()),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::AtprotoPersonalDataServer => "AtprotoPersonalDataServer",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum ServiceEndpoint {
+    BlueskyPds(String),
+    Other(String),
+}
+
+impl ServiceEndpoint {
+    fn from_str(s: &str) -> Self {
+        if let Some(host) = s
+            .strip_prefix("https://")
+            .and_then(|h| h.strip_suffix(".host.bsky.network"))
+        {
+            Self::BlueskyPds(host.to_string())
+        } else {
+            Self::Other(s.to_string())
+        }
+    }
+
+    fn as_string(&self) -> String {
+        match self {
+            Self::BlueskyPds(h) => format!("https://{h}.host.bsky.network"),
+            Self::Other(s) => s.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredService {
-    r#type: String,
-    endpoint: String,
+    r#type: ServiceType,
+    endpoint: ServiceEndpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,9 +390,9 @@ struct StoredOp {
     prev: Option<PlcCid>,
 
     rotation_keys: Option<Vec<DidKey>>,
-    verification_methods: Option<BTreeMap<String, DidKey>>,
+    verification_methods: Option<BTreeMap<VerificationMethodKey, DidKey>>,
     also_known_as: Option<Vec<Aka>>,
-    services: Option<BTreeMap<String, StoredService>>,
+    services: Option<BTreeMap<ServiceKey, StoredService>>,
 
     // legacy create fields
     signing_key: Option<DidKey>,
@@ -415,7 +525,7 @@ impl StoredOp {
                     match v {
                         serde_json::Value::String(s) => match DidKey::from_did_key(&s) {
                             Ok(key) => {
-                                methods.insert(k, key);
+                                methods.insert(VerificationMethodKey::from_str(&k), key);
                             }
                             Err(e) => {
                                 errors.push(StoredOpError::InvalidField(
@@ -474,10 +584,10 @@ impl StoredOp {
                 map.into_iter()
                     .filter_map(|(k, v)| {
                         let svc = StoredService {
-                            r#type: v.get("type")?.as_str()?.to_string(),
-                            endpoint: v.get("endpoint")?.as_str()?.to_string(),
+                            r#type: ServiceType::from_str(v.get("type")?.as_str()?),
+                            endpoint: ServiceEndpoint::from_str(v.get("endpoint")?.as_str()?),
                         };
-                        Some((k, svc))
+                        Some((ServiceKey::from_str(&k), svc))
                     })
                     .collect(),
             ),
@@ -610,7 +720,12 @@ impl StoredOp {
         if let Some(methods) = &self.verification_methods {
             let obj: serde_json::Map<String, serde_json::Value> = methods
                 .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.to_string())))
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        serde_json::Value::String(v.to_string()),
+                    )
+                })
                 .collect();
             map.insert((*StoredOpField::VerificationMethods).into(), obj.into());
         }
@@ -630,10 +745,10 @@ impl StoredOp {
                 .iter()
                 .map(|(k, svc)| {
                     (
-                        k.clone(),
+                        k.as_str().to_string(),
                         serde_json::json!({
-                            "type": svc.r#type,
-                            "endpoint": svc.endpoint,
+                            "type": svc.r#type.as_str(),
+                            "endpoint": svc.endpoint.as_string(),
                         }),
                     )
                 })
@@ -663,16 +778,6 @@ impl StoredOp {
     }
 }
 
-// we have our own Op struct for fjall since we dont want to have to convert Value back to RawValue
-#[derive(Debug, Serialize)]
-pub struct Op {
-    pub did: String,
-    pub cid: String,
-    pub created_at: Dt,
-    pub nullified: bool,
-    pub operation: serde_json::Value,
-}
-
 // this is basically Op, but without the cid and created_at fields
 // since we have them in the key already
 #[derive(Debug, Deserialize, Serialize)]
@@ -682,6 +787,16 @@ struct DbOp {
     pub did: Vec<u8>,
     pub nullified: bool,
     pub operation: StoredOp,
+}
+
+// we have our own Op struct for fjall since we dont want to have to convert Value back to RawValue
+#[derive(Debug, Serialize)]
+pub struct Op {
+    pub did: String,
+    pub cid: String,
+    pub created_at: Dt,
+    pub nullified: bool,
+    pub operation: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -1060,19 +1175,71 @@ mod tests {
     }
 
     #[test]
-    fn handle_roundtrip() {
+    fn bsky_handle_roundtrip() {
         let h = Aka::from_str("at://alice.bsky.social");
-        assert_eq!(h, Aka::Atproto("alice.bsky.social".to_string()));
+        assert_eq!(h, Aka::Bluesky("alice".to_string()));
         assert_eq!(h.to_string(), "at://alice.bsky.social");
     }
 
     #[test]
-    fn handle_without_prefix() {
-        // According to DID spec, alsoKnownAs should be URIs.
-        // If an alternative URI scheme is used, it will preserve it.
+    fn atproto_handle_roundtrip() {
+        let h = Aka::from_str("at://alice.example.com");
+        assert_eq!(h, Aka::Atproto("alice.example.com".to_string()));
+        assert_eq!(h.to_string(), "at://alice.example.com");
+    }
+
+    #[test]
+    fn other_handle_roundtrip() {
         let h = Aka::from_str("https://something.else");
         assert_eq!(h, Aka::Other("https://something.else".to_string()));
         assert_eq!(h.to_string(), "https://something.else");
+    }
+
+    #[test]
+    fn verification_method_key_roundtrip() {
+        let k1 = VerificationMethodKey::from_str("atproto");
+        assert_eq!(k1, VerificationMethodKey::Atproto);
+        assert_eq!(k1.to_string(), "atproto");
+
+        let k2 = VerificationMethodKey::from_str("other_key");
+        assert_eq!(k2, VerificationMethodKey::Other("other_key".to_string()));
+        assert_eq!(k2.to_string(), "other_key");
+    }
+
+    #[test]
+    fn service_key_roundtrip() {
+        let k1 = ServiceKey::from_str("atproto_pds");
+        assert_eq!(k1, ServiceKey::AtprotoPds);
+        assert_eq!(k1.to_string(), "atproto_pds");
+
+        let k2 = ServiceKey::from_str("other_svc");
+        assert_eq!(k2, ServiceKey::Other("other_svc".to_string()));
+        assert_eq!(k2.to_string(), "other_svc");
+    }
+
+    #[test]
+    fn service_type_roundtrip() {
+        let t1 = ServiceType::from_str("AtprotoPersonalDataServer");
+        assert_eq!(t1, ServiceType::AtprotoPersonalDataServer);
+        assert_eq!(t1.as_str(), "AtprotoPersonalDataServer");
+
+        let t2 = ServiceType::from_str("OtherType");
+        assert_eq!(t2, ServiceType::Other("OtherType".to_string()));
+        assert_eq!(t2.as_str(), "OtherType");
+    }
+
+    #[test]
+    fn service_endpoint_roundtrip() {
+        let e1 = ServiceEndpoint::from_str("https://example.host.bsky.network");
+        assert_eq!(e1, ServiceEndpoint::BlueskyPds("example".to_string()));
+        assert_eq!(e1.as_string(), "https://example.host.bsky.network");
+
+        let e2 = ServiceEndpoint::from_str("https://other.endpoint.com");
+        assert_eq!(
+            e2,
+            ServiceEndpoint::Other("https://other.endpoint.com".to_string())
+        );
+        assert_eq!(e2.as_string(), "https://other.endpoint.com");
     }
 
     #[test]
