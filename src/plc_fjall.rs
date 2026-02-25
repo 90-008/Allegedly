@@ -1,3 +1,4 @@
+use crate::{BundleSource, Week};
 use crate::{Dt, ExportPage, Op as CommonOp, PageBoundaryState};
 use anyhow::Context;
 use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
@@ -5,12 +6,14 @@ use fjall::{
     Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode,
     config::BlockSizePolicy,
 };
+use futures::Future;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 const SEP: u8 = 0;
@@ -1022,17 +1025,21 @@ impl FjallDb {
 
     pub fn export_ops(
         &self,
-        after: Option<Dt>,
-        limit: usize,
+        range: impl std::ops::RangeBounds<Dt>,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Op>> + '_> {
-        let iter = if let Some(after) = after {
-            let start = (after.timestamp_micros() as u64).to_be_bytes();
-            self.inner.ops.range(start..)
-        } else {
-            self.inner.ops.iter()
+        use std::ops::Bound;
+        let map_bound = |b: Bound<&Dt>| -> Bound<[u8; 8]> {
+            match b {
+                Bound::Included(dt) => Bound::Included(dt.timestamp_micros().to_be_bytes()),
+                Bound::Excluded(dt) => Bound::Excluded(dt.timestamp_micros().to_be_bytes()),
+                Bound::Unbounded => Bound::Unbounded,
+            }
         };
+        let range = (map_bound(range.start_bound()), map_bound(range.end_bound()));
 
-        Ok(iter.take(limit).map(|item| {
+        let iter = self.inner.ops.range(range);
+
+        Ok(iter.map(|item| {
             let (key, value) = item
                 .into_inner()
                 .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
@@ -1059,6 +1066,58 @@ impl FjallDb {
                 operation: db_op.operation.to_json_value(),
             })
         }))
+    }
+
+    pub fn export_ops_week(
+        &self,
+        week: Week,
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Op>> + '_> {
+        let after: Dt = week.into();
+        let before: Dt = week.next().into();
+
+        self.export_ops(after..before)
+    }
+}
+
+impl BundleSource for FjallDb {
+    fn reader_for(
+        &self,
+        week: Week,
+    ) -> impl Future<Output = anyhow::Result<impl AsyncRead + Send>> + Send {
+        let db = self.clone();
+
+        async move {
+            let (mut tx, rx) = tokio::io::duplex(1024 * 1024 * 64);
+
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let iter = db.export_ops_week(week)?;
+
+                let rt = tokio::runtime::Handle::current();
+
+                for op_res in iter {
+                    let op = op_res?;
+                    let operation_str = serde_json::to_string(&op.operation)?;
+                    let common_op = crate::Op {
+                        did: op.did,
+                        cid: op.cid,
+                        created_at: op.created_at,
+                        nullified: op.nullified,
+                        operation: serde_json::value::RawValue::from_string(operation_str)?,
+                    };
+
+                    let mut json_bytes = serde_json::to_vec(&common_op)?;
+                    json_bytes.push(b'\n');
+
+                    if rt.block_on(tx.write_all(&json_bytes)).is_err() {
+                        break;
+                    }
+                }
+
+                Ok(())
+            });
+
+            Ok(rx)
+        }
     }
 }
 
@@ -1149,68 +1208,6 @@ pub async fn pages_to_fjall(
         t0.elapsed()
     );
     Ok("pages_to_fjall")
-}
-
-pub async fn fjall_to_pages(
-    db: FjallDb,
-    dest: mpsc::Sender<ExportPage>,
-    until: Option<Dt>,
-) -> anyhow::Result<&'static str> {
-    log::info!("starting fjall_to_pages backfill source...");
-
-    let t0 = Instant::now();
-
-    let dest_clone = dest.clone();
-    let ops_sent = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-        let iter = db.export_ops(None, usize::MAX)?;
-        let mut current_page = Vec::with_capacity(1000);
-        let mut count = 0;
-
-        for op_res in iter {
-            let op = op_res?;
-
-            if let Some(u) = until {
-                if op.created_at >= u {
-                    break;
-                }
-            }
-
-            let operation_str = serde_json::to_string(&op.operation)?;
-            let common_op = crate::Op {
-                did: op.did,
-                cid: op.cid,
-                created_at: op.created_at,
-                nullified: op.nullified,
-                operation: serde_json::value::RawValue::from_string(operation_str)?,
-            };
-
-            current_page.push(common_op);
-            count += 1;
-
-            if current_page.len() >= 1000 {
-                let page = ExportPage {
-                    ops: std::mem::take(&mut current_page),
-                };
-                if dest_clone.blocking_send(page).is_err() {
-                    break;
-                }
-            }
-        }
-
-        if !current_page.is_empty() {
-            let page = ExportPage { ops: current_page };
-            let _ = dest_clone.blocking_send(page);
-        }
-
-        Ok(count)
-    })
-    .await??;
-
-    log::info!(
-        "finished sending {ops_sent} ops from fjall in {:?}",
-        t0.elapsed()
-    );
-    Ok("fjall_to_pages")
 }
 
 #[cfg(test)]

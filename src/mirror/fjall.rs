@@ -275,8 +275,8 @@ async fn fjall_export(
     let db = fjall.clone();
 
     let ops = tokio::task::spawn_blocking(move || {
-        let iter = db.export_ops(after, limit)?;
-        iter.collect::<anyhow::Result<Vec<_>>>()
+        let iter = db.export_ops(after.unwrap_or(Dt::UNIX_EPOCH)..)?;
+        iter.take(limit).collect::<anyhow::Result<Vec<_>>>()
     })
     .await
     .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?

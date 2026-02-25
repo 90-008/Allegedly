@@ -2,7 +2,7 @@ use allegedly::{
     Db, Dt, ExportPage, FjallDb, FolderSource, HttpSource, backfill, backfill_to_fjall,
     backfill_to_pg,
     bin::{GlobalArgs, bin_init},
-    fjall_to_pages, full_pages, logo, pages_to_fjall, pages_to_pg, pages_to_stdout, poll_upstream,
+    full_pages, logo, pages_to_fjall, pages_to_pg, pages_to_stdout, poll_upstream,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -139,7 +139,7 @@ pub async fn run(
             log::trace!("opening source fjall db at {fjall_path:?}...");
             let db = FjallDb::open(&fjall_path)?;
             log::trace!("opened source fjall db");
-            tasks.spawn(fjall_to_pages(db, bulk_tx, until));
+            tasks.spawn(backfill(db, bulk_tx, source_workers.unwrap_or(4), until));
         } else if let Some(dir) = dir {
             if http != DEFAULT_HTTP.parse()? {
                 anyhow::bail!(

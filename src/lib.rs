@@ -19,7 +19,7 @@ pub use backfill::backfill;
 pub use cached_value::{CachedValue, Fetcher};
 pub use client::{CLIENT, UA};
 pub use mirror::{ExperimentalConf, ListenConf, serve, serve_fjall};
-pub use plc_fjall::{FjallDb, backfill_to_fjall, fjall_to_pages, pages_to_fjall};
+pub use plc_fjall::{FjallDb, backfill_to_fjall, pages_to_fjall};
 pub use plc_pg::{Db, backfill_to_pg, pages_to_pg};
 pub use poll::{PageBoundaryState, get_page, poll_upstream};
 pub use ratelimit::{CreatePlcOpLimiter, GovernorMiddleware, IpLimiters};

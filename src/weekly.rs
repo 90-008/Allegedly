@@ -101,7 +101,8 @@ impl BundleSource for FolderSource {
         let file = File::open(path)
             .await
             .inspect_err(|e| log::error!("failed to open file: {e}"))?;
-        Ok(file)
+        let decoder = GzipDecoder::new(BufReader::new(file));
+        Ok(decoder)
     }
 }
 
@@ -112,7 +113,7 @@ impl BundleSource for HttpSource {
         use futures::TryStreamExt;
         let HttpSource(base) = self;
         let url = base.join(&format!("{}.jsonl.gz", week.0))?;
-        Ok(CLIENT
+        let stream = CLIENT
             .get(url)
             .send()
             .await?
@@ -120,7 +121,9 @@ impl BundleSource for HttpSource {
             .bytes_stream()
             .map_err(futures::io::Error::other)
             .into_async_read()
-            .compat())
+            .compat();
+        let decoder = GzipDecoder::new(BufReader::new(stream));
+        Ok(decoder)
     }
 }
 
@@ -213,8 +216,7 @@ pub async fn week_to_pages(
             }
         };
 
-        let decoder = GzipDecoder::new(BufReader::new(reader));
-        let mut chunks = pin!(LinesStream::new(BufReader::new(decoder).lines()).try_chunks(10000));
+        let mut chunks = pin!(LinesStream::new(BufReader::new(reader).lines()).try_chunks(10000));
         let mut success = true;
 
         while let Some(chunk) = match chunks.as_mut().try_next().await {
