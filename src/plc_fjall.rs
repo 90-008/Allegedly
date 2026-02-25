@@ -472,9 +472,9 @@ impl StoredOp {
             Some(serde_json::Value::Array(arr)) => {
                 let mut keys = Vec::with_capacity(arr.len());
                 let mut failed = false;
-                for v in arr {
+                for v in &arr {
                     match v {
-                        serde_json::Value::String(s) => match DidKey::from_did_key(&s) {
+                        serde_json::Value::String(s) => match DidKey::from_did_key(s) {
                             Ok(k) => keys.push(k),
                             Err(e) => {
                                 errors.push(StoredOpError::InvalidField(
@@ -496,13 +496,10 @@ impl StoredOp {
                     }
                 }
                 if failed {
-                    // we don't have the original array anymore here because we consumed it,
-                    // but we can reconstruct it for the unknown map if we really want to,
-                    // though usually we just move the whole thing.
-                    // since we consumed it, let's just push an error and return None.
-                    // to be absolutely correct about preserving 'unknown', we should have peeked or cloned.
-                    // let's adjust the implementation to clone if we suspect it might fail,
-                    // OR just move the whole value back if it fails.
+                    unknown.insert(
+                        StoredOpField::RotationKeys.to_string(),
+                        serde_json::Value::Array(arr),
+                    );
                     Option::None
                 } else {
                     Some(keys)
@@ -523,11 +520,11 @@ impl StoredOp {
             Some(serde_json::Value::Object(map)) => {
                 let mut methods = BTreeMap::new();
                 let mut failed = false;
-                for (k, v) in map {
+                for (k, v) in &map {
                     match v {
-                        serde_json::Value::String(s) => match DidKey::from_did_key(&s) {
+                        serde_json::Value::String(s) => match DidKey::from_did_key(s) {
                             Ok(key) => {
-                                methods.insert(VerificationMethodKey::from_str(&k), key);
+                                methods.insert(VerificationMethodKey::from_str(k), key);
                             }
                             Err(e) => {
                                 errors.push(StoredOpError::InvalidField(
@@ -548,7 +545,15 @@ impl StoredOp {
                         }
                     }
                 }
-                if failed { Option::None } else { Some(methods) }
+                if failed {
+                    unknown.insert(
+                        StoredOpField::VerificationMethods.to_string(),
+                        serde_json::Value::Object(map),
+                    );
+                    Option::None
+                } else {
+                    Some(methods)
+                }
             }
             Some(v) => {
                 errors.push(StoredOpError::TypeMismatch(
@@ -562,14 +567,32 @@ impl StoredOp {
         };
 
         let also_known_as = match obj.remove(&*StoredOpField::AlsoKnownAs) {
-            Some(serde_json::Value::Array(arr)) => Some(
-                arr.into_iter()
-                    .filter_map(|v| match v {
-                        serde_json::Value::String(s) => Some(Aka::from_str(&s)),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
+            Some(serde_json::Value::Array(arr)) => {
+                let mut akas = Vec::with_capacity(arr.len());
+                let mut failed = false;
+                for v in &arr {
+                    match v {
+                        serde_json::Value::String(s) => akas.push(Aka::from_str(s)),
+                        _ => {
+                            errors.push(StoredOpError::TypeMismatch(
+                                StoredOpField::AlsoKnownAs,
+                                "string inside array",
+                            ));
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if failed {
+                    unknown.insert(
+                        StoredOpField::AlsoKnownAs.to_string(),
+                        serde_json::Value::Array(arr),
+                    );
+                    Option::None
+                } else {
+                    Some(akas)
+                }
+            }
             Some(v) => {
                 errors.push(StoredOpError::TypeMismatch(
                     StoredOpField::AlsoKnownAs,
@@ -582,17 +605,38 @@ impl StoredOp {
         };
 
         let services = match obj.remove(&*StoredOpField::Services) {
-            Some(serde_json::Value::Object(map)) => Some(
-                map.into_iter()
-                    .filter_map(|(k, v)| {
+            Some(serde_json::Value::Object(map)) => {
+                let mut svcs = BTreeMap::new();
+                let mut failed = false;
+                for (k, v) in &map {
+                    if let (Some(r#type), Some(endpoint)) = (
+                        v.get("type").and_then(|t| t.as_str()),
+                        v.get("endpoint").and_then(|e| e.as_str()),
+                    ) {
                         let svc = StoredService {
-                            r#type: ServiceType::from_str(v.get("type")?.as_str()?),
-                            endpoint: ServiceEndpoint::from_str(v.get("endpoint")?.as_str()?),
+                            r#type: ServiceType::from_str(r#type),
+                            endpoint: ServiceEndpoint::from_str(endpoint),
                         };
-                        Some((ServiceKey::from_str(&k), svc))
-                    })
-                    .collect(),
-            ),
+                        svcs.insert(ServiceKey::from_str(k), svc);
+                    } else {
+                        errors.push(StoredOpError::TypeMismatch(
+                            StoredOpField::Services,
+                            "missing or invalid type/endpoint in service object",
+                        ));
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    unknown.insert(
+                        StoredOpField::Services.to_string(),
+                        serde_json::Value::Object(map),
+                    );
+                    Option::None
+                } else {
+                    Some(svcs)
+                }
+            }
             Some(v) => {
                 errors.push(StoredOpError::TypeMismatch(
                     StoredOpField::Services,

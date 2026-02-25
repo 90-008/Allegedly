@@ -1,2 +1,4 @@
 /target
 weekly/
+/.envrc
+/.direnv
