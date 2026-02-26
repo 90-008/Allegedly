@@ -4,10 +4,7 @@ use crate::{
 };
 use anyhow::Context;
 use data_encoding::BASE32_NOPAD;
-use fjall::{
-    Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode,
-    config::BlockSizePolicy,
-};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, config::BlockSizePolicy};
 use futures::Future;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -92,7 +89,7 @@ fn decode_timestamp(key: &[u8]) -> anyhow::Result<Dt> {
 }
 
 /// CID string → binary CID bytes
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PlcCid(#[serde(with = "serde_bytes")] Vec<u8>);
 
 impl PlcCid {
@@ -847,6 +844,7 @@ impl FjallDb {
             // 32mb is too low we can afford more
             // this should be configurable though!
             .cache_size(mb(256))
+            .manual_journal_persist(true)
             .open()?;
         let opts = KeyspaceCreateOptions::default;
         let ops = db.keyspace("ops", || {
@@ -877,8 +875,8 @@ impl FjallDb {
         Ok(())
     }
 
-    pub fn persist(&self) -> fjall::Result<()> {
-        self.inner.db.persist(PersistMode::SyncAll)
+    pub fn persist(&self, mode: PersistMode) -> fjall::Result<()> {
+        self.inner.db.persist(mode)
     }
 
     pub fn compact(&self) -> fjall::Result<()> {
@@ -902,7 +900,7 @@ impl FjallDb {
             .map(Some)
     }
 
-    pub fn insert_op(&self, batch: &mut OwnedWriteBatch, op: &CommonOp) -> anyhow::Result<usize> {
+    pub fn insert_op<const VERIFY: bool>(&self, op: &CommonOp) -> anyhow::Result<usize> {
         let cid_bytes = decode_cid_str(&op.cid)?;
         let cid_prefix = cid_bytes
             .get(..30)
@@ -927,32 +925,56 @@ impl FjallDb {
             return Ok(0);
         }
 
-        // get keys from either prev or genesis op
-        let prev_op = self._ops_for_did(&op.did)?.rev().next().transpose()?;
-        let keys = prev_op.as_ref().map_or_else(
-            || operation.get_keys(),
-            |(_, _, op)| op.operation.get_keys(),
-        );
+        if VERIFY {
+            let prev_op = operation
+                .prev
+                .as_ref()
+                .map(|prev_cid| {
+                    self._ops_for_did(&op.did)
+                        .map(|ops| {
+                            ops.rev()
+                                .find(|r| r.as_ref().map_or(true, |(_, cid, _)| cid == prev_cid))
+                                .transpose()
+                        })
+                        .flatten()
+                })
+                .transpose()?
+                .flatten();
 
-        if keys.is_empty() {
-            log::warn!("no keys for op {} {}", op.did, op.cid);
-            return Ok(0);
-        }
-
-        let data = {
-            let serde_json::Value::Object(mut data) = operation.to_json_value() else {
-                unreachable!("we checked if operation is valid already")
+            let keys: Vec<&DidKey> = match &operation.prev {
+                None => operation.get_keys(),
+                Some(_) => match &prev_op {
+                    None => {
+                        log::error!(
+                            "op {} {} has prev but the prev op is not found",
+                            op.did,
+                            op.cid
+                        );
+                        return Ok(0);
+                    }
+                    Some((_, _, prev)) => prev.operation.get_keys(),
+                },
             };
-            data.remove("sig");
-            serde_json::Value::Object(data)
-        };
-        let results = assure_valid_sig(keys, &operation.sig, &data)?;
-        if !results.valid {
-            for err in results.errors {
-                log::warn!("invalid signature for op {} {}: {err}", op.did, op.cid);
+
+            if keys.is_empty() {
+                log::warn!("no keys for op {} {}", op.did, op.cid);
+                return Ok(0);
             }
-            // don't accept invalid ops
-            return Ok(0);
+
+            let data = {
+                let serde_json::Value::Object(mut data) = operation.to_json_value() else {
+                    unreachable!("we checked if operation is valid already")
+                };
+                data.remove("sig");
+                serde_json::Value::Object(data)
+            };
+            let results = assure_valid_sig(keys, &operation.sig, &data)?;
+            if !results.valid {
+                for err in results.errors {
+                    log::warn!("invalid signature for op {} {}: {err}", op.did, op.cid);
+                }
+                return Ok(0);
+            }
         }
 
         let db_op = DbOp {
@@ -966,6 +988,7 @@ impl FjallDb {
             operation,
         };
 
+        let mut batch = self.inner.db.batch();
         batch.insert(
             &self.inner.ops,
             op_key(&op.created_at, cid_suffix),
@@ -976,6 +999,7 @@ impl FjallDb {
             by_did_key(&op.did, &op.created_at, cid_suffix)?,
             &[],
         );
+        batch.commit()?;
 
         Ok(1)
     }
@@ -983,7 +1007,7 @@ impl FjallDb {
     fn _ops_for_did(
         &self,
         did: &str,
-    ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<(Dt, String, DbOp)>> + '_>
+    ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<(Dt, PlcCid, DbOp)>> + '_>
     {
         let prefix = by_did_prefix(did)?;
 
@@ -1016,7 +1040,7 @@ impl FjallDb {
             let mut full_cid_bytes = op.cid_prefix.clone();
             full_cid_bytes.extend_from_slice(cid_suffix);
 
-            let cid = decode_cid(&full_cid_bytes)?;
+            let cid = PlcCid(full_cid_bytes);
 
             Ok((ts, cid, op))
         }))
@@ -1029,6 +1053,7 @@ impl FjallDb {
         Ok(self._ops_for_did(did)?.map(|res| {
             let (ts, cid, op) = res?;
 
+            let cid = decode_cid(&cid.0)?;
             let did = decode_did(&op.did);
 
             Ok(Op {
@@ -1155,27 +1180,44 @@ pub async fn backfill_to_fjall(
 
     let mut last_at = None;
     let mut ops_inserted: usize = 0;
+    let mut insert_tasks: tokio::task::JoinSet<anyhow::Result<usize>> = tokio::task::JoinSet::new();
 
-    while let Some(page) = pages.recv().await {
-        let should_track = notify_last_at.is_some();
-        if should_track {
-            if let Some(s) = PageBoundaryState::new(&page) {
-                last_at = last_at.filter(|&l| l >= s.last_at).or(Some(s.last_at));
+    loop {
+        let pages_finished = pages.is_closed();
+        if pages_finished && insert_tasks.is_empty() {
+            break;
+        }
+        tokio::select! {
+            page = pages.recv(), if !pages_finished => {
+                let Some(page) = page else { continue; };
+                if notify_last_at.is_some() {
+                    if let Some(s) = PageBoundaryState::new(&page) {
+                        last_at = last_at.filter(|&l| l >= s.last_at).or(Some(s.last_at));
+                    }
+                }
+                let db = db.clone();
+                // we don't have to wait for inserts to finish, because insert_op
+                // without verification does not read anything from the db
+                insert_tasks.spawn_blocking(move || {
+                    let mut count: usize = 0;
+                    for op in &page.ops {
+                        // we don't verify sigs for bulk, since pages might be out of order
+                        count += db.insert_op::<false>(op)?;
+                    }
+                    db.persist(PersistMode::Buffer)?;
+                    Ok(count)
+                });
+            }
+            Some(res) = insert_tasks.join_next() => {
+                match res? {
+                    Ok(count) => ops_inserted += count,
+                    Err(e) => {
+                        insert_tasks.abort_all();
+                        return Err(e);
+                    }
+                }
             }
         }
-
-        let db = db.clone();
-        let count = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let mut batch = db.inner.db.batch();
-            let mut count: usize = 0;
-            for op in &page.ops {
-                count += db.insert_op(&mut batch, op)?;
-            }
-            batch.commit()?;
-            Ok(count)
-        })
-        .await??;
-        ops_inserted += count;
     }
     log::debug!("finished receiving bulk pages");
 
@@ -1186,8 +1228,7 @@ pub async fn backfill_to_fjall(
         };
     }
 
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || db.persist()).await??;
+    tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll)).await??;
 
     log::info!(
         "backfill_to_fjall: inserted {ops_inserted} ops in {:?}",
@@ -1209,12 +1250,11 @@ pub async fn pages_to_fjall(
         log::trace!("writing page with {} ops", page.ops.len());
         let db = db.clone();
         let count = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let mut batch = db.inner.db.batch();
             let mut count: usize = 0;
             for op in &page.ops {
-                count += db.insert_op(&mut batch, op)?;
+                count += db.insert_op::<true>(op)?;
             }
-            batch.commit()?;
+            db.persist(PersistMode::Buffer)?;
             Ok(count)
         })
         .await??;
