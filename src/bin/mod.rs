@@ -49,7 +49,8 @@ pub fn bin_init(enable_otlp: bool) {
         .with(stderr_log)
         .with(otel);
 
-    tracing::subscriber::set_global_default(subscriber).expect("to set global tracing subscriber");
+    use tracing_subscriber::util::SubscriberInitExt;
+    subscriber.init();
 }
 
 #[allow(dead_code)]
