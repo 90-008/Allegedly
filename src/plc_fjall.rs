@@ -1,7 +1,9 @@
-use crate::{BundleSource, Week};
-use crate::{Dt, ExportPage, Op as CommonOp, PageBoundaryState};
+use crate::{
+    BundleSource, Dt, ExportPage, Op as CommonOp, PageBoundaryState, Week,
+    crypto::{DidKey, Signature},
+};
 use anyhow::Context;
-use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
+use data_encoding::BASE32_NOPAD;
 use fjall::{
     Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode,
     config::BlockSizePolicy,
@@ -87,50 +89,6 @@ fn decode_timestamp(key: &[u8]) -> anyhow::Result<Dt> {
     );
     Dt::from_timestamp_micros(micros as i64)
         .ok_or_else(|| anyhow::anyhow!("invalid timestamp {micros}"))
-}
-
-/// base64url-encoded ECDSA signature → raw bytes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Signature(#[serde(with = "serde_bytes")] Vec<u8>);
-
-impl Signature {
-    fn from_base64url(s: &str) -> anyhow::Result<Self> {
-        BASE64URL_NOPAD
-            .decode(s.as_bytes())
-            .map(Self)
-            .map_err(|e| anyhow::anyhow!("invalid base64url sig {s}: {e}"))
-    }
-}
-
-impl fmt::Display for Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&BASE64URL_NOPAD.encode(&self.0))
-    }
-}
-
-/// did:key:z... → raw multicodec public key bytes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DidKey(#[serde(with = "serde_bytes")] Vec<u8>);
-
-impl DidKey {
-    fn from_did_key(s: &str) -> anyhow::Result<Self> {
-        let multibase_str = s
-            .strip_prefix("did:key:")
-            .ok_or_else(|| anyhow::anyhow!("missing did:key: prefix in {s}"))?;
-        let (_base, bytes) = multibase::decode(multibase_str)
-            .map_err(|e| anyhow::anyhow!("invalid multibase in did:key {s}: {e}"))?;
-        Ok(Self(bytes))
-    }
-}
-
-impl fmt::Display for DidKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "did:key:{}",
-            multibase::encode(multibase::Base::Base58Btc, &self.0)
-        )
-    }
 }
 
 /// CID string → binary CID bytes
@@ -1213,21 +1171,6 @@ pub async fn pages_to_fjall(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn signature_roundtrip() {
-        let original = "9NuYV7AqwHVTc0YuWzNV3CJafsSZWH7qCxHRUIP2xWlB-YexXC1OaYAnUayiCXLVzRQ8WBXIqF-SvZdNalwcjA";
-        let sig = Signature::from_base64url(original).unwrap();
-        assert_eq!(sig.0.len(), 64);
-        assert_eq!(sig.to_string(), original);
-    }
-
-    #[test]
-    fn did_key_roundtrip() {
-        let original = "did:key:zQ3shhCGUqDKjStzuDxPkTxN6ujddP4RkEKJJouJGRRkaLGbg";
-        let key = DidKey::from_did_key(original).unwrap();
-        assert_eq!(key.to_string(), original);
-    }
 
     #[test]
     fn plc_cid_roundtrip() {

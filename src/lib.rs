@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 mod backfill;
 mod cached_value;
 mod client;
+mod crypto;
 pub mod doc;
 mod mirror;
 mod plc_fjall;
