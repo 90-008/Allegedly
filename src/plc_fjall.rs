@@ -1,6 +1,6 @@
 use crate::{
     BundleSource, Dt, ExportPage, Op as CommonOp, PageBoundaryState, Week,
-    crypto::{DidKey, Signature},
+    crypto::{DidKey, Signature, assure_valid_sig},
 };
 use anyhow::Context;
 use data_encoding::BASE32_NOPAD;
@@ -368,6 +368,21 @@ struct StoredOp {
 }
 
 impl StoredOp {
+    fn get_keys(&self) -> Vec<&DidKey> {
+        let mut keys = Vec::with_capacity(self.rotation_keys.as_ref().map_or(2, |keys| keys.len()));
+        if let Some(rot_keys) = self.rotation_keys.as_ref() {
+            keys.extend(rot_keys.iter());
+        } else {
+            // legacy genesis op
+            if let Some(recovery_key) = self.recovery_key.as_ref() {
+                keys.push(recovery_key);
+            }
+            if let Some(signing_key) = self.signing_key.as_ref() {
+                keys.push(signing_key);
+            }
+        }
+        keys
+    }
     fn from_json_value(v: serde_json::Value) -> (Option<Self>, Vec<StoredOpError>) {
         let serde_json::Value::Object(mut obj) = v else {
             return (None, vec![StoredOpError::NotAnObject]);
@@ -897,46 +912,79 @@ impl FjallDb {
             .get(30..)
             .ok_or_else(|| anyhow::anyhow!("invalid cid length (suffix): {}", op.cid))?;
 
-        let pk = by_did_key(&op.did, &op.created_at, cid_suffix)?;
-        if self.inner.by_did.get(&pk)?.is_some() {
-            return Ok(0);
-        }
-        let ts_key = op_key(&op.created_at, cid_suffix);
-
-        let mut encoded_did = Vec::with_capacity(15);
-        encode_did(&mut encoded_did, &op.did)?;
-
-        let json_val: serde_json::Value = serde_json::from_str(op.operation.get())?;
-        let (stored, mut errors) = StoredOp::from_json_value(json_val);
+        let op_json: serde_json::Value = serde_json::from_str(op.operation.get())?;
+        let (stored, mut errors) = StoredOp::from_json_value(op_json);
 
         let Some(operation) = stored else {
             return Err(errors.remove(0)).context("fatal operation parse error");
         };
 
-        for e in &errors {
-            log::warn!("failed to parse operation {} {}: {}", op.did, op.cid, e);
+        for err in &errors {
+            log::warn!("failed to parse operation {} {}: {err}", op.did, op.cid);
         }
         if !errors.is_empty() {
             // if parse failed but not fatal, we just dont store it
             return Ok(0);
         }
 
+        // get keys from either prev or genesis op
+        let prev_op = self._ops_for_did(&op.did)?.rev().next().transpose()?;
+        let keys = prev_op.as_ref().map_or_else(
+            || operation.get_keys(),
+            |(_, _, op)| op.operation.get_keys(),
+        );
+
+        if keys.is_empty() {
+            log::warn!("no keys for op {} {}", op.did, op.cid);
+            return Ok(0);
+        }
+
+        let data = {
+            let serde_json::Value::Object(mut data) = operation.to_json_value() else {
+                unreachable!("we checked if operation is valid already")
+            };
+            data.remove("sig");
+            serde_json::Value::Object(data)
+        };
+        let results = assure_valid_sig(keys, &operation.sig, &data)?;
+        if !results.valid {
+            for err in results.errors {
+                log::warn!("invalid signature for op {} {}: {err}", op.did, op.cid);
+            }
+            // don't accept invalid ops
+            return Ok(0);
+        }
+
         let db_op = DbOp {
-            did: encoded_did,
+            did: {
+                let mut encoded_did = Vec::with_capacity(15);
+                encode_did(&mut encoded_did, &op.did)?;
+                encoded_did
+            },
             cid_prefix,
             nullified: op.nullified,
             operation,
         };
-        let value = rmp_serde::to_vec(&db_op)?;
-        batch.insert(&self.inner.ops, &ts_key, &value);
-        batch.insert(&self.inner.by_did, &pk, &[]);
+
+        batch.insert(
+            &self.inner.ops,
+            op_key(&op.created_at, cid_suffix),
+            rmp_serde::to_vec(&db_op)?,
+        );
+        batch.insert(
+            &self.inner.by_did,
+            by_did_key(&op.did, &op.created_at, cid_suffix)?,
+            &[],
+        );
+
         Ok(1)
     }
 
-    pub fn ops_for_did(
+    fn _ops_for_did(
         &self,
         did: &str,
-    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Op>> + '_> {
+    ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<(Dt, String, DbOp)>> + '_>
+    {
         let prefix = by_did_prefix(did)?;
 
         Ok(self.inner.by_did.prefix(&prefix).map(move |guard| {
@@ -969,6 +1017,18 @@ impl FjallDb {
             full_cid_bytes.extend_from_slice(cid_suffix);
 
             let cid = decode_cid(&full_cid_bytes)?;
+
+            Ok((ts, cid, op))
+        }))
+    }
+
+    pub fn ops_for_did(
+        &self,
+        did: &str,
+    ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<Op>> + '_> {
+        Ok(self._ops_for_did(did)?.map(|res| {
+            let (ts, cid, op) = res?;
+
             let did = decode_did(&op.did);
 
             Ok(Op {
@@ -1283,7 +1343,6 @@ mod tests {
                     panic!("{msg}");
                 }
 
-                // msgpack verification
                 let packed = rmp_serde::to_vec(&stored).unwrap();
                 let unpacked: StoredOp = rmp_serde::from_slice(&packed).unwrap();
 
