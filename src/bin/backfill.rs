@@ -44,21 +44,16 @@ pub struct Args {
     /// Cert for postgres (if needed)
     #[arg(long)]
     postgres_cert: Option<PathBuf>,
-    /// Delete all operations from the postgres db before starting
+    /// Delete all operations from the db before starting
     ///
-    /// only used if `--to-postgres` is present
+    /// only used if `--to-postgres` or `--to-fjall` is present
     #[arg(long, action)]
-    postgres_reset: bool,
+    reset: bool,
     /// Bulk load into a local fjall embedded database
     ///
     /// Pass a directory path for the fjall database
-    #[arg(long, conflicts_with_all = ["to_postgres", "postgres_cert", "postgres_reset"])]
+    #[arg(long, conflicts_with_all = ["to_postgres", "postgres_cert"])]
     to_fjall: Option<PathBuf>,
-    /// Delete all operations from the fjall db before starting
-    ///
-    /// only used if `--to-fjall` is present
-    #[arg(long, action, requires = "to_fjall")]
-    fjall_reset: bool,
     /// Stop at the week ending before this date
     #[arg(long)]
     until: Option<Dt>,
@@ -80,9 +75,8 @@ pub async fn run(
         source_workers,
         to_postgres,
         postgres_cert,
-        postgres_reset,
+        reset,
         to_fjall,
-        fjall_reset,
         until,
         catch_up,
     }: Args,
@@ -180,7 +174,7 @@ pub async fn run(
 
             tasks.spawn(backfill_to_fjall(
                 db.clone(),
-                fjall_reset,
+                reset,
                 bulk_out,
                 found_last_tx,
             ));
@@ -192,12 +186,7 @@ pub async fn run(
             let db = Db::new(pg_url.as_str(), postgres_cert).await?;
             log::trace!("connected to postgres");
 
-            tasks.spawn(backfill_to_pg(
-                db.clone(),
-                postgres_reset,
-                bulk_out,
-                found_last_tx,
-            ));
+            tasks.spawn(backfill_to_pg(db.clone(), reset, bulk_out, found_last_tx));
             if catch_up {
                 tasks.spawn(pages_to_pg(db, full_out));
             }

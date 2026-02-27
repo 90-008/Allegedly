@@ -5,6 +5,7 @@ use std::{path::PathBuf, time::Duration, time::Instant};
 use tokio::fs::create_dir_all;
 use tokio::sync::mpsc;
 
+mod audit;
 mod backfill;
 mod mirror;
 
@@ -56,6 +57,13 @@ enum Commands {
     Wrap {
         #[command(flatten)]
         args: mirror::Args,
+        #[command(flatten)]
+        instrumentation: InstrumentationArgs,
+    },
+    /// Audit a plc database for correctness
+    Audit {
+        #[command(flatten)]
+        args: audit::Args,
         #[command(flatten)]
         instrumentation: InstrumentationArgs,
     },
@@ -118,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Mirror { args, .. } => mirror::run(globals, args, true).await?,
         Commands::Wrap { args, .. } => mirror::run(globals, args, false).await?,
+        Commands::Audit { args, .. } => audit::run(args).await?,
         Commands::Tail { after } => {
             let mut url = globals.upstream;
             url.set_path("/export");

@@ -1,6 +1,6 @@
 use crate::{
     BundleSource, Dt, ExportPage, Op as CommonOp, PageBoundaryState, Week,
-    crypto::{DidKey, Signature, assure_valid_sig},
+    crypto::{AssuranceResults, DidKey, Signature, assure_valid_sig},
 };
 use anyhow::Context;
 use data_encoding::BASE32_NOPAD;
@@ -797,6 +797,32 @@ impl StoredOp {
     }
 }
 
+fn verify_op_sig(op: &StoredOp, prev: Option<&StoredOp>) -> anyhow::Result<AssuranceResults> {
+    let keys: Vec<&DidKey> = match &op.prev {
+        None => op.get_keys(),
+        Some(_) => match prev {
+            None => anyhow::bail!("prev cid exists but the op for that cid is missing"),
+            Some(p) => p.get_keys(),
+        },
+    };
+
+    if keys.is_empty() {
+        anyhow::bail!("no keys found for genesis op or prev op");
+    }
+
+    let data = {
+        let serde_json::Value::Object(mut data) = op.to_json_value() else {
+            unreachable!("we know op is valid, because it comes from StoredOp")
+        };
+        data.remove("sig");
+        serde_json::Value::Object(data)
+    };
+
+    let results = assure_valid_sig(keys, &op.sig, &data)
+        .expect("that our op is an object and we removed sig field");
+    Ok(results)
+}
+
 // this is basically Op, but without the cid and created_at fields
 // since we have them in the key already
 #[derive(Debug, Deserialize, Serialize)]
@@ -941,40 +967,27 @@ impl FjallDb {
                 .transpose()?
                 .flatten();
 
-            let keys: Vec<&DidKey> = match &operation.prev {
-                None => operation.get_keys(),
-                Some(_) => match &prev_op {
-                    None => {
-                        log::error!(
-                            "op {} {} has prev but the prev op is not found",
-                            op.did,
-                            op.cid
-                        );
+            let prev_stored = prev_op.as_ref().map(|(_, _, p)| &p.operation);
+
+            match verify_op_sig(&operation, prev_stored) {
+                Ok(results) => {
+                    if !results.valid {
+                        let msg = results
+                            .errors
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        log::warn!("invalid op {} {}:\n{msg}", op.did, op.cid);
                         return Ok(0);
                     }
-                    Some((_, _, prev)) => prev.operation.get_keys(),
-                },
-            };
-
-            if keys.is_empty() {
-                log::warn!("no keys for op {} {}", op.did, op.cid);
-                return Ok(0);
-            }
-
-            let data = {
-                let serde_json::Value::Object(mut data) = operation.to_json_value() else {
-                    unreachable!("we checked if operation is valid already")
-                };
-                data.remove("sig");
-                serde_json::Value::Object(data)
-            };
-            let results = assure_valid_sig(keys, &operation.sig, &data)?;
-            if !results.valid {
-                for err in results.errors {
-                    log::warn!("invalid signature for op {} {}: {err}", op.did, op.cid);
                 }
-                return Ok(0);
+                Err(e) => {
+                    log::warn!("invalid op {} {}: {e}", op.did, op.cid);
+                    return Ok(0);
+                }
             }
+            log::debug!("verified op {} {}", op.did, op.cid);
         }
 
         let db_op = DbOp {
@@ -1004,6 +1017,38 @@ impl FjallDb {
         Ok(1)
     }
 
+    fn decode_by_did_entry(
+        &self,
+        by_did_key: &[u8],
+        prefix_len: usize,
+    ) -> anyhow::Result<(Dt, PlcCid, DbOp)> {
+        let key_rest = by_did_key
+            .get(prefix_len..)
+            .ok_or_else(|| anyhow::anyhow!("invalid by_did key {by_did_key:?}"))?;
+
+        let ts_bytes = key_rest
+            .get(..8)
+            .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
+        let cid_suffix = key_rest
+            .get(9..)
+            .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
+
+        let op_key = [ts_bytes, &[SEP][..], cid_suffix].concat();
+        let ts = decode_timestamp(ts_bytes)?;
+
+        let value = self
+            .inner
+            .ops
+            .get(&op_key)?
+            .ok_or_else(|| anyhow::anyhow!("op not found: {op_key:?}"))?;
+
+        let op: DbOp = rmp_serde::from_slice(&value)?;
+        let mut full_cid = op.cid_prefix.clone();
+        full_cid.extend_from_slice(cid_suffix);
+
+        Ok((ts, PlcCid(full_cid), op))
+    }
+
     fn _ops_for_did(
         &self,
         did: &str,
@@ -1015,34 +1060,7 @@ impl FjallDb {
             let (by_did_key, _) = guard
                 .into_inner()
                 .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
-
-            let key_rest = by_did_key
-                .get(prefix.len()..)
-                .ok_or_else(|| anyhow::anyhow!("invalid by_did key {by_did_key:?}"))?;
-
-            let ts_bytes = key_rest
-                .get(..8)
-                .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
-            let cid_suffix = key_rest
-                .get(9..)
-                .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
-
-            let op_key = [ts_bytes, &[SEP][..], cid_suffix].concat();
-            let ts = decode_timestamp(ts_bytes)?;
-
-            let value = self
-                .inner
-                .ops
-                .get(&op_key)?
-                .ok_or_else(|| anyhow::anyhow!("op not found: {op_key:?}"))?;
-
-            let op: DbOp = rmp_serde::from_slice(&value)?;
-            let mut full_cid_bytes = op.cid_prefix.clone();
-            full_cid_bytes.extend_from_slice(cid_suffix);
-
-            let cid = PlcCid(full_cid_bytes);
-
-            Ok((ts, cid, op))
+            self.decode_by_did_entry(&by_did_key, prefix.len())
         }))
     }
 
@@ -1111,14 +1129,168 @@ impl FjallDb {
         }))
     }
 
-    pub fn export_ops_week(
-        &self,
-        week: Week,
-    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Op>> + '_> {
-        let after: Dt = week.into();
-        let before: Dt = week.next().into();
+    pub fn drop_op(&self, did_str: &str, created_at: &Dt, cid: &str) -> anyhow::Result<()> {
+        let cid = decode_cid_str(cid)?;
+        let cid_suffix = &cid[30..];
 
-        self.export_ops(after..before)
+        let op_key = op_key(created_at, cid_suffix);
+        let by_did_key = by_did_key(did_str, created_at, cid_suffix)?;
+
+        let mut batch = self.inner.db.batch();
+        batch.remove(&self.inner.ops, op_key);
+        batch.remove(&self.inner.by_did, by_did_key);
+        batch.commit()?;
+
+        Ok(())
+    }
+
+    pub fn audit(
+        &self,
+        invalid_ops_tx: mpsc::Sender<(String, Dt, String)>,
+    ) -> anyhow::Result<(usize, usize)> {
+        use std::sync::mpsc;
+
+        let ops = self.inner.by_did.len()?;
+
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        type Batch = (Vec<u8>, Vec<(Dt, PlcCid, DbOp)>);
+        let (result_tx, result_rx) = mpsc::sync_channel::<anyhow::Result<(usize, usize)>>(workers);
+
+        let channels: Vec<_> = (0..workers)
+            .map(|_| mpsc::sync_channel::<Batch>(512))
+            .collect();
+        let senders: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
+
+        std::thread::scope(|s| {
+            for (_, rx) in channels {
+                let result_tx = result_tx.clone();
+                let invalid_ops_tx = invalid_ops_tx.clone();
+                s.spawn(move || {
+                    let mut checked: usize = 0;
+                    let mut failed: usize = 0;
+                    while let Ok((did_prefix, ops)) = rx.recv() {
+                        let did = decode_did(&did_prefix[..did_prefix.len() - 1]);
+                        for (ts, cid, op) in &ops {
+                            checked += 1;
+                            let prev_op = op.operation.prev.as_ref().and_then(|expected| {
+                                ops.iter().find(|(_, c, _)| c == expected)
+                            });
+                            let prev_cid_ok = op.operation.prev.is_none() || prev_op.is_some();
+                            if !prev_cid_ok {
+                                log::error!("audit: op {did} {cid} prev cid mismatch or missing predecessor, is db corrupted?");
+                                failed += 1;
+                                let _ = invalid_ops_tx.blocking_send((did.clone(), ts.clone(), cid.to_string()));
+                                continue;
+                            }
+                            let prev_stored = prev_op.map(|(_, _, p)| &p.operation);
+                            match verify_op_sig(&op.operation, prev_stored) {
+                                Ok(results) => {
+                                    if !results.valid {
+                                        let msg = results
+                                            .errors
+                                            .iter()
+                                            .map(|e| e.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join("\n    ");
+                                        log::warn!("audit: invalid op {} {}:\n    {msg}", did, cid);
+                                        failed += 1;
+                                        let _ = invalid_ops_tx.blocking_send((did.clone(), ts.clone(), cid.to_string()));
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("audit: invalid op {} {}: {e}", did, cid);
+                                    failed += 1;
+                                    let _ = invalid_ops_tx.blocking_send((did.clone(), ts.clone(), cid.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    let _ = result_tx.send(Ok((checked, failed)));
+                });
+            }
+            drop(result_tx);
+
+            // todo: probably dont use a macro...
+            macro_rules! spawn_scan_thread {
+                ($iter_method:ident, $start_idx:expr, $reverse:expr, $limit:expr) => {{
+                    let senders = senders.clone();
+                    let mut iter = self.inner.by_did.iter();
+
+                    s.spawn(move || -> anyhow::Result<()> {
+                        let mut current_prefix: Option<[u8; 16]> = None;
+                        let mut did_ops: Vec<(Dt, PlcCid, DbOp)> = Vec::new();
+                        let mut idx = $start_idx;
+                        let mut processed_ops: usize = 0;
+
+                        while let Some(guard) = iter.$iter_method() {
+                            let (by_did_key, _) = guard
+                                .into_inner()
+                                .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
+
+                            let mut prefix_array = [0u8; 16];
+                            prefix_array.copy_from_slice(by_did_key.get(..16).ok_or_else(
+                                || anyhow::anyhow!("by_did key too short: {by_did_key:?}"),
+                            )?);
+
+                            let op = self.decode_by_did_entry(&by_did_key, 16)?;
+
+                            if current_prefix.map_or(true, |cp| cp != prefix_array) {
+                                // new did, push the ops
+                                if let Some(prefix) = current_prefix.take() {
+                                    if $reverse {
+                                        did_ops.reverse();
+                                    }
+                                    senders[idx % workers]
+                                        .send((prefix.to_vec(), std::mem::take(&mut did_ops)))
+                                        .ok();
+                                    idx += 1;
+
+                                    if processed_ops >= $limit {
+                                        break;
+                                    }
+                                }
+                                current_prefix = Some(prefix_array);
+                            }
+
+                            did_ops.push(op);
+                            processed_ops += 1;
+                        }
+
+                        if let Some(prefix) = current_prefix {
+                            if $reverse {
+                                did_ops.reverse();
+                            }
+                            senders[idx % workers].send((prefix.to_vec(), did_ops)).ok();
+                        }
+
+                        Ok(())
+                    })
+                }};
+            }
+
+            // we can start two threads, one for forward iteration and one for reverse iteration
+            // this way we have two scans in parallel which should be faster!
+            let f_handle = spawn_scan_thread!(next, 0, false, ops / 2);
+            let b_handle = spawn_scan_thread!(next_back, workers / 2, true, ops - (ops / 2));
+
+            f_handle.join().unwrap()?;
+            b_handle.join().unwrap()?;
+
+            drop(senders);
+
+            let mut total_checked: usize = 0;
+            let mut total_failed: usize = 0;
+            for res in result_rx {
+                let (c, f) = res?;
+                total_checked += c;
+                total_failed += f;
+            }
+
+            Ok((total_checked, total_failed))
+        })
     }
 }
 
@@ -1130,10 +1302,13 @@ impl BundleSource for FjallDb {
         let db = self.clone();
 
         async move {
-            let (mut tx, rx) = tokio::io::duplex(1024 * 1024 * 64);
+            let (mut tx, rx) = tokio::io::duplex(1024 * 1024 * 16);
 
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let iter = db.export_ops_week(week)?;
+                let after: Dt = week.into();
+                let before: Dt = week.next().into();
+
+                let iter = db.export_ops(after..before)?;
 
                 let rt = tokio::runtime::Handle::current();
 
@@ -1184,6 +1359,7 @@ pub async fn backfill_to_fjall(
 
     loop {
         let pages_finished = pages.is_closed();
+        // we can stop if we have no more pages and all the insert tasks are finished
         if pages_finished && insert_tasks.is_empty() {
             break;
         }
@@ -1266,6 +1442,33 @@ pub async fn pages_to_fjall(
         t0.elapsed()
     );
     Ok("pages_to_fjall")
+}
+
+pub async fn audit(
+    db: FjallDb,
+    invalid_ops_tx: mpsc::Sender<(String, Dt, String)>,
+) -> anyhow::Result<&'static str> {
+    log::info!("starting fjall audit...");
+    let t0 = std::time::Instant::now();
+    let (checked, failed) = tokio::task::spawn_blocking(move || db.audit(invalid_ops_tx)).await??;
+    log::info!(
+        "fjall audit complete in {:?}, {checked} ops checked",
+        t0.elapsed()
+    );
+    if failed > 0 {
+        anyhow::bail!("audit found {failed} invalid operations");
+    }
+    Ok("audit_fjall")
+}
+
+pub async fn drop_invalid_ops(
+    db: FjallDb,
+    mut invalid_ops_rx: mpsc::Receiver<(String, Dt, String)>,
+) -> anyhow::Result<&'static str> {
+    while let Some((did, at, cid)) = invalid_ops_rx.recv().await {
+        db.drop_op(&did, &at, &cid)?;
+    }
+    Ok("drop_invalid_ops")
 }
 
 #[cfg(test)]
