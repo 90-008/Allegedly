@@ -315,6 +315,7 @@ impl ServiceType {
 enum ServiceEndpoint {
     BlueskyPds(String),
     Other(String),
+    BlueskySocial,
 }
 
 impl ServiceEndpoint {
@@ -324,6 +325,8 @@ impl ServiceEndpoint {
             .and_then(|h| h.strip_suffix(".host.bsky.network"))
         {
             Self::BlueskyPds(host.to_string())
+        } else if s == "https://bsky.social" {
+            Self::BlueskySocial
         } else {
             Self::Other(s.to_string())
         }
@@ -332,6 +335,7 @@ impl ServiceEndpoint {
     fn as_string(&self) -> String {
         match self {
             Self::BlueskyPds(h) => format!("https://{h}.host.bsky.network"),
+            Self::BlueskySocial => "https://bsky.social".to_string(),
             Self::Other(s) => s.clone(),
         }
     }
