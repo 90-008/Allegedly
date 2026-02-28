@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Mirror { args, .. } => mirror::run(globals, args, true).await?,
         Commands::Wrap { args, .. } => mirror::run(globals, args, false).await?,
-        Commands::Audit { args, .. } => audit::run(args).await?,
+        Commands::Audit { args, .. } => audit::run(globals, args).await?,
         Commands::Tail { after } => {
             let mut url = globals.upstream;
             url.set_path("/export");

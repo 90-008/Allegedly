@@ -1,7 +1,7 @@
 use allegedly::{
     FjallDb, audit_fjall,
-    bin::{InstrumentationArgs, bin_init},
-    drop_invalid_ops_fjall, file_to_invalid_ops, invalid_ops_to_stdout, logo,
+    bin::{GlobalArgs, InstrumentationArgs, bin_init},
+    file_to_invalid_ops, fix_ops_fjall, invalid_ops_to_stdout, logo,
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -12,12 +12,15 @@ pub struct Args {
     /// path to a local fjall database directory
     #[arg(long, env = "ALLEGEDLY_FJALL")]
     fjall: Option<PathBuf>,
-    /// path to a file containing invalid ops to fix
+    /// path to a file containing invalid ops to fix using upstream
     #[arg(long, env = "ALLEGEDLY_FIX")]
     fix: Option<PathBuf>,
+    /// drop invalid ops instead of trying to fix them from upstream
+    #[arg(long, env = "ALLEGEDLY_DROP")]
+    drop: bool,
 }
 
-pub async fn run(Args { fjall, fix }: Args) -> anyhow::Result<()> {
+pub async fn run(globals: GlobalArgs, Args { fjall, fix, drop }: Args) -> anyhow::Result<()> {
     let mut tasks = JoinSet::new();
 
     if let Some(fjall) = fjall {
@@ -26,7 +29,7 @@ pub async fn run(Args { fjall, fix }: Args) -> anyhow::Result<()> {
 
         if let Some(fix) = fix {
             tasks.spawn(file_to_invalid_ops(fix, invalid_ops_tx));
-            tasks.spawn(drop_invalid_ops_fjall(db, invalid_ops_rx));
+            tasks.spawn(fix_ops_fjall(db, globals.upstream, drop, invalid_ops_rx));
         } else {
             tasks.spawn(audit_fjall(db, invalid_ops_tx));
             tasks.spawn(invalid_ops_to_stdout(invalid_ops_rx));
@@ -61,6 +64,8 @@ pub async fn run(Args { fjall, fix }: Args) -> anyhow::Result<()> {
 #[derive(Debug, Parser)]
 struct CliArgs {
     #[command(flatten)]
+    globals: GlobalArgs,
+    #[command(flatten)]
     instrumentation: InstrumentationArgs,
     #[command(flatten)]
     args: Args,
@@ -72,6 +77,6 @@ async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     bin_init(args.instrumentation.enable_opentelemetry);
     log::info!("{}", logo("audit"));
-    run(args.args).await?;
+    run(args.globals, args.args).await?;
     Ok(())
 }

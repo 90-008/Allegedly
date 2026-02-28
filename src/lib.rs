@@ -20,7 +20,9 @@ pub use backfill::backfill;
 pub use cached_value::{CachedValue, Fetcher};
 pub use client::{CLIENT, UA};
 pub use mirror::{ExperimentalConf, ListenConf, serve, serve_fjall};
-pub use plc_fjall::{FjallDb, audit as audit_fjall, backfill_to_fjall, pages_to_fjall, drop_invalid_ops as drop_invalid_ops_fjall};
+pub use plc_fjall::{
+    FjallDb, audit as audit_fjall, backfill_to_fjall, fix_ops as fix_ops_fjall, pages_to_fjall,
+};
 pub use plc_pg::{Db, backfill_to_pg, pages_to_pg};
 pub use poll::{PageBoundaryState, get_page, poll_upstream};
 pub use ratelimit::{CreatePlcOpLimiter, GovernorMiddleware, IpLimiters};
@@ -138,37 +140,36 @@ pub async fn pages_to_stdout(
     Ok("pages_to_stdout")
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvalidOp {
+    pub did: String,
+    pub at: Dt,
+    pub cid: String,
+}
+
 pub async fn invalid_ops_to_stdout(
-    mut rx: mpsc::Receiver<(String, Dt, String)>,
+    mut rx: mpsc::Receiver<InvalidOp>,
 ) -> anyhow::Result<&'static str> {
-    while let Some((did, at, cid)) = rx.recv().await {
-        let val = serde_json::json!({
-            "did": did,
-            "at": at,
-            "cid": cid,
-        });
-        println!("{val}");
+    while let Some(op) = rx.recv().await {
+        use std::io::{Write, stdout};
+        let mut stdout = stdout().lock();
+        serde_json::to_writer(&mut stdout, &op)?;
+        stdout.write_all(b"\n")?;
     }
     Ok("invalid_ops_to_stdout")
 }
 
 pub async fn file_to_invalid_ops(
     path: impl AsRef<std::path::Path>,
-    tx: mpsc::Sender<(String, Dt, String)>,
+    tx: mpsc::Sender<InvalidOp>,
 ) -> anyhow::Result<&'static str> {
     let file = tokio::fs::File::open(path).await?;
 
     use tokio::io::AsyncBufReadExt;
     let mut lines = tokio::io::BufReader::new(file).lines();
     while let Some(line) = lines.next_line().await? {
-        #[derive(serde::Deserialize)]
-        struct Op {
-            did: String,
-            at: Dt,
-            cid: String,
-        }
-        let op: Op = serde_json::from_str(&line)?;
-        tx.send((op.did, op.at, op.cid)).await?;
+        let op: InvalidOp = serde_json::from_str(&line)?;
+        tx.send(op).await?;
     }
 
     Ok("invalid_ops_to_stdout")

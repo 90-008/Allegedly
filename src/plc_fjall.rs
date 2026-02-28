@@ -1,5 +1,5 @@
 use crate::{
-    BundleSource, Dt, ExportPage, Op as CommonOp, PageBoundaryState, Week,
+    BundleSource, Dt, ExportPage, InvalidOp, Op as CommonOp, PageBoundaryState, Week,
     crypto::{AssuranceResults, DidKey, Signature, assure_valid_sig},
 };
 use anyhow::Context;
@@ -1148,10 +1148,7 @@ impl FjallDb {
         Ok(())
     }
 
-    pub fn audit(
-        &self,
-        invalid_ops_tx: mpsc::Sender<(String, Dt, String)>,
-    ) -> anyhow::Result<(usize, usize)> {
+    pub fn audit(&self, invalid_ops_tx: mpsc::Sender<InvalidOp>) -> anyhow::Result<(usize, usize)> {
         use std::sync::mpsc;
 
         let ops = self.inner.by_did.len()?;
@@ -1178,6 +1175,13 @@ impl FjallDb {
                     while let Ok((did_prefix, ops)) = rx.recv() {
                         let did = decode_did(&did_prefix[..did_prefix.len() - 1]);
                         for (ts, cid, op) in &ops {
+                            let send_invalid = || {
+                                let _ = invalid_ops_tx.blocking_send(InvalidOp {
+                                    did: did.clone(),
+                                    at: ts.clone(),
+                                    cid: cid.to_string(),
+                                });
+                            };
                             checked += 1;
                             let prev_op = op.operation.prev.as_ref().and_then(|expected| {
                                 ops.iter().find(|(_, c, _)| c == expected)
@@ -1186,7 +1190,7 @@ impl FjallDb {
                             if !prev_cid_ok {
                                 log::error!("audit: op {did} {cid} prev cid mismatch or missing predecessor, is db corrupted?");
                                 failed += 1;
-                                let _ = invalid_ops_tx.blocking_send((did.clone(), ts.clone(), cid.to_string()));
+                                send_invalid();
                                 continue;
                             }
                             let prev_stored = prev_op.map(|(_, _, p)| &p.operation);
@@ -1201,13 +1205,13 @@ impl FjallDb {
                                             .join("\n    ");
                                         log::warn!("audit: invalid op {} {}:\n    {msg}", did, cid);
                                         failed += 1;
-                                        let _ = invalid_ops_tx.blocking_send((did.clone(), ts.clone(), cid.to_string()));
+                                        send_invalid();
                                     }
                                 }
                                 Err(e) => {
                                     log::warn!("audit: invalid op {} {}: {e}", did, cid);
                                     failed += 1;
-                                    let _ = invalid_ops_tx.blocking_send((did.clone(), ts.clone(), cid.to_string()));
+                                    send_invalid();
                                 }
                             }
                         }
@@ -1450,7 +1454,7 @@ pub async fn pages_to_fjall(
 
 pub async fn audit(
     db: FjallDb,
-    invalid_ops_tx: mpsc::Sender<(String, Dt, String)>,
+    invalid_ops_tx: mpsc::Sender<InvalidOp>,
 ) -> anyhow::Result<&'static str> {
     log::info!("starting fjall audit...");
     let t0 = std::time::Instant::now();
@@ -1465,14 +1469,91 @@ pub async fn audit(
     Ok("audit_fjall")
 }
 
-pub async fn drop_invalid_ops(
+pub async fn fix_ops(
     db: FjallDb,
-    mut invalid_ops_rx: mpsc::Receiver<(String, Dt, String)>,
+    upstream: reqwest::Url,
+    only_drop: bool,
+    mut invalid_ops_rx: mpsc::Receiver<InvalidOp>,
 ) -> anyhow::Result<&'static str> {
-    while let Some((did, at, cid)) = invalid_ops_rx.recv().await {
-        db.drop_op(&did, &at, &cid)?;
+    log::info!("starting fjall fix ops...");
+    let mut fixed_dids = std::collections::HashSet::new();
+    let mut count = 0;
+
+    let latest_at = db
+        .get_latest()?
+        .ok_or_else(|| anyhow::anyhow!("db not backfilled? expected at least one op"))?;
+
+    while let Some(op) = invalid_ops_rx.recv().await {
+        let InvalidOp { did, at, cid, .. } = op;
+
+        if only_drop {
+            db.drop_op(&did, &at, &cid)?;
+            db.persist(PersistMode::Buffer)?;
+            count += 1;
+            continue;
+        }
+
+        if fixed_dids.contains(&did) {
+            continue;
+        }
+
+        log::trace!("fetching upstream ops to fix did: {did}");
+        let mut url = upstream.clone();
+        url.set_path(&format!("/{did}/log/audit"));
+
+        let resp = crate::CLIENT.get(url).send().await?;
+
+        use reqwest::StatusCode;
+        let ops: Vec<CommonOp> = match resp.status() {
+            StatusCode::OK => match resp.json().await {
+                Ok(ops) => ops,
+                Err(e) => {
+                    log::warn!("failed to parse upstream ops for {did}: {e}");
+                    continue;
+                }
+            },
+            StatusCode::NOT_FOUND => {
+                log::trace!("did not found upstream: {did}");
+                Vec::new() // this essentially means drop the whole did
+            }
+            s => {
+                log::warn!("failed to fetch upstream for {did}: {s}");
+                continue;
+            }
+        };
+
+        log::trace!("fetched {} ops for {did}", ops.len());
+
+        // we drop all ops first just to be safe
+        let existing = db.ops_for_did(&did)?;
+        for op in existing {
+            let op = op?;
+            db.drop_op(&did, &op.created_at, &op.cid)?;
+        }
+
+        // then insert the fresh ops
+        for op in ops {
+            // skip newer ops, since we will fill them in later anyway
+            // if we don't skip these we might miss some ops in between
+            // the latest_at we started with vs the one we ended up with
+            if op.created_at > latest_at {
+                log::trace!(
+                    "skipping op {} for {did} because it is newer than latest_at {latest_at}",
+                    op.cid
+                );
+                continue;
+            }
+
+            count += db.insert_op::<true>(&op)?;
+        }
+
+        db.persist(PersistMode::Buffer)?;
+        fixed_dids.insert(did);
     }
-    Ok("drop_invalid_ops")
+
+    log::info!("fixed {count} ops");
+
+    Ok("fix_ops_fjall")
 }
 
 #[cfg(test)]
