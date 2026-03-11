@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 mod backfill;
 mod cached_value;
 mod client;
-mod crypto;
+pub mod crypto;
 pub mod doc;
 mod mirror;
 mod plc_fjall;
@@ -21,10 +21,12 @@ pub use cached_value::{CachedValue, Fetcher};
 pub use client::{CLIENT, UA};
 pub use mirror::{ExperimentalConf, ListenConf, serve, serve_fjall};
 pub use plc_fjall::{
-    FjallDb, audit as audit_fjall, backfill_to_fjall, fix_ops as fix_ops_fjall, pages_to_fjall,
+    FjallDb, audit as audit_fjall, backfill_to_fjall, fix_ops as fix_ops_fjall, seq_pages_to_fjall,
 };
 pub use plc_pg::{Db, backfill_to_pg, pages_to_pg};
-pub use poll::{PageBoundaryState, get_page, poll_upstream};
+pub use poll::{
+    PageBoundaryState, get_page, poll_upstream, poll_upstream_seq, tail_upstream_stream,
+};
 pub use ratelimit::{CreatePlcOpLimiter, GovernorMiddleware, IpLimiters};
 pub use weekly::{BundleSource, FolderSource, HttpSource, Week, pages_to_weeks, week_to_pages};
 
@@ -85,6 +87,46 @@ impl From<&Op> for OpKey {
     }
 }
 
+/// A PLC op from `/export?after=<seq>` or `/export/stream`
+///
+/// Both endpoints return the `seq` field per op, which is a globally monotonic
+/// unsigned integer assigned by the PLC directory.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeqOp {
+    pub seq: u64,
+    pub did: String,
+    pub cid: String,
+    pub created_at: Dt,
+    #[serde(default)]
+    pub nullified: bool,
+    pub operation: Box<serde_json::value::RawValue>,
+}
+
+impl From<SeqOp> for Op {
+    fn from(s: SeqOp) -> Self {
+        Op {
+            did: s.did,
+            cid: s.cid,
+            created_at: s.created_at,
+            nullified: s.nullified,
+            operation: s.operation,
+        }
+    }
+}
+
+/// A page of sequenced ops from `/export?after=<seq>`
+#[derive(Debug)]
+pub struct SeqPage {
+    pub ops: Vec<SeqOp>,
+}
+
+impl SeqPage {
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
 /// page forwarder who drops its channels on receipt of a small page
 ///
 /// PLC will return up to 1000 ops on a page, and returns full pages until it
@@ -92,6 +134,33 @@ impl From<&Op> for OpKey {
 pub async fn full_pages(
     mut rx: mpsc::Receiver<ExportPage>,
     tx: mpsc::Sender<ExportPage>,
+) -> anyhow::Result<&'static str> {
+    while let Some(page) = rx.recv().await {
+        let n = page.ops.len();
+        if n < 900 {
+            let last_age = page.ops.last().map(|op| chrono::Utc::now() - op.created_at);
+            let Some(age) = last_age else {
+                log::info!("full_pages done, empty final page");
+                return Ok("full pages (hmm)");
+            };
+            if age <= chrono::TimeDelta::hours(6) {
+                log::info!("full_pages done, final page of {n} ops");
+            } else {
+                log::warn!("full_pages finished with small page of {n} ops, but it's {age} old");
+            }
+            return Ok("full pages (cool)");
+        }
+        log::trace!("full_pages: continuing with page of {n} ops");
+        tx.send(page).await?;
+    }
+    Err(anyhow::anyhow!(
+        "full_pages ran out of source material, sender closed"
+    ))
+}
+
+pub async fn full_pages_seq(
+    mut rx: mpsc::Receiver<SeqPage>,
+    tx: mpsc::Sender<SeqPage>,
 ) -> anyhow::Result<&'static str> {
     while let Some(page) = rx.recv().await {
         let n = page.ops.len();

@@ -1,7 +1,8 @@
 use allegedly::{
     Db, ExperimentalConf, FjallDb, ListenConf,
     bin::{GlobalArgs, InstrumentationArgs, bin_init},
-    logo, pages_to_fjall, pages_to_pg, poll_upstream, serve, serve_fjall,
+    logo, pages_to_pg, poll_upstream, poll_upstream_seq, seq_pages_to_fjall, serve, serve_fjall,
+    tail_upstream_stream,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -69,6 +70,10 @@ pub struct Args {
     /// accept writes! by forwarding them upstream
     #[arg(long, action, env = "ALLEGEDLY_EXPERIMENTAL_WRITE_UPSTREAM")]
     experimental_write_upstream: bool,
+    /// switch from polling to /export/stream once the latest op is within
+    /// this many days of now (plc.directory only supports ~1 week of backfill)
+    #[arg(long, env = "ALLEGEDLY_STREAM_CUTOVER_DAYS", default_value = "5")]
+    stream_cutover_days: u32,
 }
 
 pub async fn run(
@@ -89,6 +94,7 @@ pub async fn run(
         acme_ipv6,
         experimental_acme_domain,
         experimental_write_upstream,
+        stream_cutover_days,
     }: Args,
     sync: bool,
 ) -> anyhow::Result<()> {
@@ -122,24 +128,93 @@ pub async fn run(
         let db = FjallDb::open(&fjall_path)?;
         if compact_fjall {
             log::info!("compacting fjall...");
-            db.compact()?; // blocking here is fine, we didn't start anything yet
+            db.compact()?;
         }
 
-        log::debug!("getting the latest op from fjall...");
-        let latest = db
+        log::debug!("getting the latest seq from fjall...");
+        let latest_seq = db
             .get_latest()?
+            .map(|(seq, _)| seq)
             .expect("there to be at least one op in the db. did you backfill?");
-        log::info!("starting polling from {latest}...");
+        log::info!("starting seq polling from seq {latest_seq}...");
 
-        let (send_page, recv_page) = mpsc::channel(8);
+        let (send_page, recv_page) = mpsc::channel::<allegedly::SeqPage>(8);
 
-        let mut poll_url = upstream.clone();
-        poll_url.set_path("/export");
+        let mut export_url = upstream.clone();
+        export_url.set_path("/export");
+        let mut stream_url = upstream.clone();
+        stream_url.set_path("/export/stream");
         let throttle = Duration::from_millis(upstream_throttle_ms);
+        let cutover_age = Duration::from_secs(stream_cutover_days as u64 * 86_400);
 
-        tasks.spawn(poll_upstream(Some(latest), poll_url, throttle, send_page));
-        tasks.spawn(pages_to_fjall(db.clone(), recv_page));
+        // the poll -> stream task: poll until we're caught up, then switch to stream.
+        // on stream disconnect, fall back to polling to resync.
+        let send_page_bg = send_page.clone();
+        tasks.spawn(async move {
+            let mut current_seq = latest_seq;
+            loop {
+                log::info!("seq polling from seq {current_seq}");
+                let (inner_tx, mut inner_rx) = mpsc::channel::<allegedly::SeqPage>(8);
 
+                // run poller; it ends only when the channel closes
+                let poll_url = export_url.clone();
+                let poll_task = tokio::spawn(poll_upstream_seq(
+                    Some(current_seq),
+                    poll_url,
+                    throttle,
+                    inner_tx,
+                ));
+
+                // drain pages from poller until the last op is within cutover_age of now,
+                // meaning we're close enough to the tip that the stream can cover the rest
+                let mut last_seq_from_poll = current_seq;
+
+                while let Some(page) = inner_rx.recv().await {
+                    let near_tip = page.ops.last().map_or(false, |op| {
+                        let age = chrono::Utc::now().signed_duration_since(op.created_at);
+                        age.to_std().map_or(false, |d| d <= cutover_age)
+                    });
+                    if let Some(last) = page.ops.last() {
+                        last_seq_from_poll = last.seq;
+                    }
+                    let _ = send_page_bg.send(page).await;
+                    if near_tip {
+                        break;
+                    }
+                }
+
+                poll_task.abort();
+                current_seq = last_seq_from_poll;
+
+                // switch to streaming
+                log::info!("caught up at seq {current_seq}, switching to /export/stream");
+                let (stream_inner_tx, mut stream_inner_rx) = mpsc::channel::<allegedly::SeqPage>(8);
+                let stream_task = tokio::spawn(tail_upstream_stream(
+                    Some(current_seq),
+                    stream_url.clone(),
+                    stream_inner_tx,
+                ));
+
+                while let Some(page) = stream_inner_rx.recv().await {
+                    if let Some(last) = page.ops.last() {
+                        current_seq = last.seq;
+                    }
+                    if send_page_bg.send(page).await.is_err() {
+                        stream_task.abort();
+                        return anyhow::Ok("fjall-poll-stream (dest closed)");
+                    }
+                }
+
+                // stream ended/errored — loop back to polling to resync
+                match stream_task.await {
+                    Ok(Ok(())) => log::info!("stream closed cleanly, resyncing via poll"),
+                    Ok(Err(e)) => log::warn!("stream error: {e}, resyncing via poll"),
+                    Err(e) => log::warn!("stream task join error: {e}"),
+                }
+            }
+        });
+
+        tasks.spawn(seq_pages_to_fjall(db.clone(), recv_page));
         tasks.spawn(serve_fjall(upstream, listen_conf, experimental_conf, db));
     } else {
         let wrap = wrap.ok_or(anyhow::anyhow!(

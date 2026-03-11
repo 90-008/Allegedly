@@ -15,11 +15,11 @@ Allegedly can
       --wrap-pg "postgresql://user:pass@pg-host:5432/plc-db"
     ```
 
-- Run a fully self-contained mirror using an embedded fjall database (no postgres needed):
+- Run a fully self-contained mirror using an embedded fjall database (no postgres or local plc server needed):
 
     ```bash
     # backfill first
-    allegedly backfill --to-fjall ./plc-data
+    allegedly backfill --no-bulk --to-fjall ./plc-data
 
     # then run the mirror
     allegedly mirror --wrap-fjall ./plc-data

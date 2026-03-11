@@ -14,21 +14,18 @@ struct FjallState {
 
 #[derive(Clone)]
 struct FjallSyncInfo {
-    latest_at: CachedValue<Dt, GetFjallLatestAt>,
+    latest: CachedValue<(u64, Dt), GetFjallLatest>,
     upstream_status: CachedValue<PlcStatus, CheckUpstream>,
 }
 
 #[derive(Clone)]
-struct GetFjallLatestAt(FjallDb);
-impl Fetcher<Dt> for GetFjallLatestAt {
-    async fn fetch(&self) -> Result<Dt, Box<dyn std::error::Error>> {
+struct GetFjallLatest(FjallDb);
+impl Fetcher<(u64, Dt)> for GetFjallLatest {
+    async fn fetch(&self) -> Result<(u64, Dt), Box<dyn std::error::Error>> {
         let db = self.0.clone();
-        let now = tokio::task::spawn_blocking(move || db.get_latest())
+        tokio::task::spawn_blocking(move || db.get_latest())
             .await??
-            .ok_or(anyhow::anyhow!(
-                "expected to find at least one thing in the db"
-            ))?;
-        Ok(now)
+            .ok_or_else(|| anyhow::anyhow!("db is empty").into())
     }
 }
 
@@ -116,7 +113,9 @@ async fn fjall_health(Data(FjallState { sync_info, .. }): Data<&FjallState>) -> 
     if !ok {
         overall_status = StatusCode::BAD_GATEWAY;
     }
-    let latest = sync_info.latest_at.get().await.ok();
+    let latest = sync_info.latest.get().await.ok();
+    let latest_at = latest.map(|(_, dt)| dt);
+    let latest_seq = latest.map(|(seq, _)| seq);
 
     (
         overall_status,
@@ -124,7 +123,8 @@ async fn fjall_health(Data(FjallState { sync_info, .. }): Data<&FjallState>) -> 
             "server": "allegedly (mirror/fjall)",
             "version": env!("CARGO_PKG_VERSION"),
             "upstream_plc": upstream_status,
-            "latest_at": latest,
+            "latest_at": latest_at,
+            "latest_seq": latest_seq,
         })),
     )
 }
@@ -250,7 +250,7 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
 
 #[derive(Deserialize)]
 struct ExportQuery {
-    after: Option<String>,
+    after: Option<u64>,
     #[allow(dead_code)] // we just cap at 1000 for now, matching reference impl
     count: Option<usize>,
 }
@@ -261,21 +261,12 @@ async fn fjall_export(
     Query(query): Query<ExportQuery>,
     Data(FjallState { fjall, .. }): Data<&FjallState>,
 ) -> Result<Body> {
-    let after = if let Some(a) = query.after {
-        Some(
-            chrono::DateTime::parse_from_rfc3339(&a)
-                .map_err(|e| Error::from_string(e.to_string(), StatusCode::BAD_REQUEST))?
-                .with_timezone(&chrono::Utc),
-        )
-    } else {
-        None
-    };
-
+    let after = query.after.unwrap_or(0);
     let limit = 1000;
     let db = fjall.clone();
 
     let ops = tokio::task::spawn_blocking(move || {
-        let iter = db.export_ops(after.unwrap_or(Dt::UNIX_EPOCH)..)?;
+        let iter = db.export_ops(after..)?;
         iter.take(limit).collect::<anyhow::Result<Vec<_>>>()
     })
     .await
@@ -324,7 +315,7 @@ pub async fn serve_fjall(
         .expect("reqwest client to build");
 
     let sync_info = FjallSyncInfo {
-        latest_at: CachedValue::new(GetFjallLatestAt(fjall.clone()), Duration::from_secs(2)),
+        latest: CachedValue::new(GetFjallLatest(fjall.clone()), Duration::from_secs(2)),
         upstream_status: CachedValue::new(
             CheckUpstream(upstream.clone(), client.clone()),
             Duration::from_secs(6),

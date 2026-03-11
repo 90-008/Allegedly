@@ -1,4 +1,4 @@
-use crate::{CLIENT, Dt, ExportPage, Op, OpKey};
+use crate::{CLIENT, Dt, ExportPage, Op, OpKey, SeqOp, SeqPage};
 use reqwest::Url;
 use std::time::Duration;
 use thiserror::Error;
@@ -255,6 +255,164 @@ pub async fn poll_upstream(
 
         prev_last = next_last.or(prev_last);
     }
+}
+
+/// Fetch one page of seq-based export from `/export?after=<seq>`
+async fn get_seq_page(url: Url) -> Result<SeqPage, GetPageError> {
+    use futures::TryStreamExt;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    log::trace!("getting seq page: {url}");
+
+    let res = CLIENT.get(url).send().await?.error_for_status()?;
+    let stream = Box::pin(
+        res.bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .into_async_read()
+            .compat(),
+    );
+
+    let mut lines = BufReader::new(stream).lines();
+    let mut ops = Vec::new();
+
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<SeqOp>(line) {
+                    Ok(op) => ops.push(op),
+                    Err(e) => log::warn!("failed to parse seq op: {e} ({line})"),
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!(
+                    "transport error mid-seq-page: {}; returning partial page",
+                    e
+                );
+                break;
+            }
+        }
+    }
+
+    Ok(SeqPage { ops })
+}
+
+/// Poll an upstream PLC server using seq-number-based cursoring
+///
+/// Uses `/export?after=<seq>` — each op from the server carries a `seq` field
+/// which is a globally monotonic unsigned integer. Because seq is unique per op
+/// there is no need for page-boundary deduplication.
+///
+/// Pages are sent to `dest`. Returns when the channel closes.
+pub async fn poll_upstream_seq(
+    after: Option<u64>,
+    base: Url,
+    throttle: Duration,
+    dest: mpsc::Sender<SeqPage>,
+) -> anyhow::Result<&'static str> {
+    log::info!("starting seq upstream poller at {base} after {after:?}");
+    let mut tick = tokio::time::interval(throttle);
+    let mut last_seq: u64 = after.unwrap_or(0);
+
+    loop {
+        tick.tick().await;
+
+        let mut url = base.clone();
+        url.query_pairs_mut()
+            .append_pair("after", &last_seq.to_string());
+
+        let page = match get_seq_page(url).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("error polling upstream (seq): {e}");
+                continue;
+            }
+        };
+
+        if let Some(last) = page.ops.last() {
+            last_seq = last.seq;
+        }
+
+        if !page.is_empty() {
+            match dest.try_send(page) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(page)) => {
+                    log::warn!("seq poll: destination channel full, awaiting...");
+                    dest.send(page).await?;
+                }
+                e => e?,
+            };
+        }
+    }
+}
+
+/// Tail the upstream PLC `/export/stream` WebSocket endpoint
+///
+/// `cursor` is a seq number to resume from. The server only supports backfill
+/// of up to ~1 week (server-configurable), so this cannot replay from seq 0.
+/// Use `poll_upstream_seq` to catch up first, then hand off to this function.
+///
+/// Messages arrive as single-op `SeqPage`s sent to `dest`. Returns on
+/// disconnect so the caller can reconnect or fall back to polling.
+pub async fn tail_upstream_stream(
+    cursor: Option<u64>,
+    base: Url,
+    dest: mpsc::Sender<SeqPage>,
+) -> anyhow::Result<()> {
+    use futures::StreamExt;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let mut url = base.clone();
+    // convert ws(s):// scheme if needed; some callers pass http(s)://
+    let ws_scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => "ws",
+    }
+    .to_owned();
+    url.set_scheme(&ws_scheme)
+        .map_err(|_| anyhow::anyhow!("failed to set websocket scheme"))?;
+    if let Some(seq) = cursor {
+        url.query_pairs_mut()
+            .append_pair("cursor", &seq.to_string());
+    }
+
+    log::info!("connecting to stream: {url}");
+    let (mut ws, _) = connect_async(url.as_str()).await?;
+    log::info!("stream connected");
+
+    while let Some(msg) = ws.next().await {
+        let msg = msg?;
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => {
+                log::info!("stream closed by server");
+                break;
+            }
+            _ => continue,
+        };
+
+        let op: SeqOp = match serde_json::from_str(&text) {
+            Ok(op) => op,
+            Err(e) => {
+                log::warn!("failed to parse stream event: {e} ({text})");
+                continue;
+            }
+        };
+
+        let page = SeqPage { ops: vec![op] };
+        if dest.send(page).await.is_err() {
+            log::info!("stream dest channel closed, stopping");
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

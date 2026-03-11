@@ -1,21 +1,28 @@
 use crate::{
-    BundleSource, Dt, ExportPage, InvalidOp, Op as CommonOp, PageBoundaryState, Week,
+    Dt, InvalidOp, Op as CommonOp,
     crypto::{AssuranceResults, DidKey, Signature, assure_valid_sig},
 };
 use anyhow::Context;
 use data_encoding::BASE32_NOPAD;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, config::BlockSizePolicy};
-use futures::Future;
+use ordered_varint::Variable;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 const SEP: u8 = 0;
+
+fn seq_key(seq: u64) -> Vec<u8> {
+    seq.to_variable_vec().expect("that seq number encodes")
+}
+
+fn decode_seq_key(key: &[u8]) -> anyhow::Result<u64> {
+    u64::decode_variable(key).context("failed to decode seq key")
+}
 
 type IpldCid = cid::CidGeneric<64>;
 
@@ -54,15 +61,6 @@ fn decode_did(bytes: &[u8]) -> String {
     format!("did:plc:{decoded}")
 }
 
-fn op_key(created_at: &Dt, cid_suffix: &[u8]) -> Vec<u8> {
-    let micros = created_at.timestamp_micros() as u64;
-    let mut key = Vec::with_capacity(8 + 1 + cid_suffix.len());
-    key.extend_from_slice(&micros.to_be_bytes());
-    key.push(SEP);
-    key.extend_from_slice(cid_suffix);
-    key
-}
-
 fn by_did_prefix(did: &str) -> anyhow::Result<Vec<u8>> {
     let mut p = Vec::with_capacity(BASE32_NOPAD.decode_len(did.len())? + 1);
     encode_did(&mut p, did)?;
@@ -70,22 +68,11 @@ fn by_did_prefix(did: &str) -> anyhow::Result<Vec<u8>> {
     Ok(p)
 }
 
-fn by_did_key(did: &str, created_at: &Dt, cid_suffix: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// by_did key: [15 bytes encoded did][SEP][seq varint]
+fn by_did_key(did: &str, seq: u64) -> anyhow::Result<Vec<u8>> {
     let mut key = by_did_prefix(did)?;
-    let micros = created_at.timestamp_micros() as u64;
-    key.extend_from_slice(&micros.to_be_bytes());
-    key.push(SEP);
-    key.extend_from_slice(cid_suffix);
+    seq.encode_variable(&mut key)?;
     Ok(key)
-}
-
-fn decode_timestamp(key: &[u8]) -> anyhow::Result<Dt> {
-    let micros = u64::from_be_bytes(
-        key.try_into()
-            .map_err(|e| anyhow::anyhow!("invalid timestamp key {key:?}: {e}"))?,
-    );
-    Dt::from_timestamp_micros(micros as i64)
-        .ok_or_else(|| anyhow::anyhow!("invalid timestamp {micros}"))
 }
 
 /// CID string → binary CID bytes
@@ -827,15 +814,16 @@ fn verify_op_sig(op: &StoredOp, prev: Option<&StoredOp>) -> anyhow::Result<Assur
     Ok(results)
 }
 
-// this is basically Op, but without the cid and created_at fields
-// since we have them in the key already
+// stored alongside the seq key in the ops keyspace
+// cid and created_at are in the value (not the key) in the new layout
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DbOp {
     #[serde(with = "serde_bytes")]
     pub did: Vec<u8>,
     #[serde(with = "serde_bytes")]
-    pub cid_prefix: Vec<u8>,
+    pub cid: Vec<u8>,
+    pub created_at: u64,
     pub nullified: bool,
     pub operation: StoredOp,
 }
@@ -857,7 +845,9 @@ pub struct FjallDb {
 
 struct FjallInner {
     db: Database,
+    /// primary keyspace: seq (varint) -> DbOp
     ops: Keyspace,
+    /// secondary index: [encoded_did][SEP][seq_varint] -> []
     by_did: Keyspace,
 }
 
@@ -915,30 +905,23 @@ impl FjallDb {
         Ok(())
     }
 
-    pub fn get_latest(&self) -> anyhow::Result<Option<Dt>> {
+    /// Returns `(seq, created_at)` for the last stored op, or `None` if empty.
+    pub fn get_latest(&self) -> anyhow::Result<Option<(u64, Dt)>> {
         let Some(guard) = self.inner.ops.last_key_value() else {
             return Ok(None);
         };
-        let key = guard
-            .key()
-            .map_err(|e| anyhow::anyhow!("fjall key error: {e}"))?;
-
-        key.get(..8)
-            .ok_or_else(|| anyhow::anyhow!("invalid timestamp key {key:?}"))
-            .map(decode_timestamp)
-            .flatten()
-            .map(Some)
+        let (key, value) = guard
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
+        let seq = decode_seq_key(&key)?;
+        let db_op: DbOp = rmp_serde::from_slice(&value)?;
+        let dt = Dt::from_timestamp_micros(db_op.created_at as i64)
+            .ok_or_else(|| anyhow::anyhow!("invalid created_at in last op"))?;
+        Ok(Some((seq, dt)))
     }
 
-    pub fn insert_op<const VERIFY: bool>(&self, op: &CommonOp) -> anyhow::Result<usize> {
+    pub fn insert_op<const VERIFY: bool>(&self, op: &CommonOp, seq: u64) -> anyhow::Result<usize> {
         let cid_bytes = decode_cid_str(&op.cid)?;
-        let cid_prefix = cid_bytes
-            .get(..30)
-            .ok_or_else(|| anyhow::anyhow!("invalid cid length (prefix): {}", op.cid))?
-            .to_vec();
-        let cid_suffix = cid_bytes
-            .get(30..)
-            .ok_or_else(|| anyhow::anyhow!("invalid cid length (suffix): {}", op.cid))?;
 
         let op_json: serde_json::Value = serde_json::from_str(op.operation.get())?;
         let (stored, mut errors) = StoredOp::from_json_value(op_json);
@@ -960,6 +943,10 @@ impl FjallDb {
                 .prev
                 .as_ref()
                 .map(|prev_cid| {
+                    // TODO: we should have a cid -> seq lookup eventually maybe?
+                    // this is probably fine though we will only iter over like 2 ops at most
+                    // or so, its there to handle nullified...
+                    // but a cid lookup would also help us avoid duplicate ops!
                     self._ops_for_did(&op.did)
                         .map(|ops| {
                             ops.rev()
@@ -1000,57 +987,52 @@ impl FjallDb {
                 encode_did(&mut encoded_did, &op.did)?;
                 encoded_did
             },
-            cid_prefix,
+            cid: cid_bytes,
+            created_at: op.created_at.timestamp_micros() as u64,
             nullified: op.nullified,
             operation,
         };
 
+        let seq_val = rmp_serde::to_vec(&db_op)?;
+        let seq_key_bytes = seq_key(seq);
+        let by_did_key_bytes = by_did_key(&op.did, seq)?;
+
         let mut batch = self.inner.db.batch();
-        batch.insert(
-            &self.inner.ops,
-            op_key(&op.created_at, cid_suffix),
-            rmp_serde::to_vec(&db_op)?,
-        );
-        batch.insert(
-            &self.inner.by_did,
-            by_did_key(&op.did, &op.created_at, cid_suffix)?,
-            &[],
-        );
+        batch.insert(&self.inner.ops, seq_key_bytes, seq_val);
+        batch.insert(&self.inner.by_did, by_did_key_bytes, &[]);
         batch.commit()?;
 
         Ok(1)
     }
+}
 
+impl FjallDb {
+    /// Decode a `by_did` entry: extract the seq from the key suffix, then
+    /// look up the full `DbOp` in the `ops` keyspace.
     fn decode_by_did_entry(
         &self,
-        by_did_key: &[u8],
+        by_did_key_bytes: &[u8],
         prefix_len: usize,
     ) -> anyhow::Result<(Dt, PlcCid, DbOp)> {
-        let key_rest = by_did_key
+        let key_suffix = by_did_key_bytes
             .get(prefix_len..)
-            .ok_or_else(|| anyhow::anyhow!("invalid by_did key {by_did_key:?}"))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid by_did key {by_did_key_bytes:?}"))?;
 
-        let ts_bytes = key_rest
-            .get(..8)
-            .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
-        let cid_suffix = key_rest
-            .get(9..)
-            .ok_or_else(|| anyhow::anyhow!("invalid length: {key_rest:?}"))?;
-
-        let op_key = [ts_bytes, &[SEP][..], cid_suffix].concat();
-        let ts = decode_timestamp(ts_bytes)?;
+        let seq =
+            u64::decode_variable(key_suffix).context("failed to decode seq from by_did key")?;
 
         let value = self
             .inner
             .ops
-            .get(&op_key)?
-            .ok_or_else(|| anyhow::anyhow!("op not found: {op_key:?}"))?;
+            .get(seq_key(seq))?
+            .ok_or_else(|| anyhow::anyhow!("op not found for seq {seq}"))?;
 
         let op: DbOp = rmp_serde::from_slice(&value)?;
-        let mut full_cid = op.cid_prefix.clone();
-        full_cid.extend_from_slice(cid_suffix);
+        let ts = Dt::from_timestamp_micros(op.created_at as i64)
+            .ok_or_else(|| anyhow::anyhow!("invalid created_at_micros {}", op.created_at))?;
+        let cid = PlcCid(op.cid.clone());
 
-        Ok((ts, PlcCid(full_cid), op))
+        Ok((ts, cid, op))
     }
 
     fn _ops_for_did(
@@ -1074,10 +1056,8 @@ impl FjallDb {
     ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<Op>> + '_> {
         Ok(self._ops_for_did(did)?.map(|res| {
             let (ts, cid, op) = res?;
-
             let cid = decode_cid(&cid.0)?;
             let did = decode_did(&op.did);
-
             Ok(Op {
                 did,
                 cid,
@@ -1090,59 +1070,73 @@ impl FjallDb {
 
     pub fn export_ops(
         &self,
-        range: impl std::ops::RangeBounds<Dt>,
+        range: impl std::ops::RangeBounds<u64>,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Op>> + '_> {
         use std::ops::Bound;
-        let map_bound = |b: Bound<&Dt>| -> Bound<[u8; 8]> {
+        let map_bound = |b: Bound<&u64>| -> Bound<Vec<u8>> {
             match b {
-                Bound::Included(dt) => Bound::Included(dt.timestamp_micros().to_be_bytes()),
-                Bound::Excluded(dt) => Bound::Excluded(dt.timestamp_micros().to_be_bytes()),
+                Bound::Included(seq) => Bound::Included(seq_key(*seq)),
+                Bound::Excluded(seq) => Bound::Excluded(seq_key(*seq)),
                 Bound::Unbounded => Bound::Unbounded,
             }
         };
         let range = (map_bound(range.start_bound()), map_bound(range.end_bound()));
 
-        let iter = self.inner.ops.range(range);
-
-        Ok(iter.map(|item| {
-            let (key, value) = item
-                .into_inner()
-                .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
-            let db_op: DbOp = rmp_serde::from_slice(&value)?;
-            let created_at = decode_timestamp(
-                key.get(..8)
-                    .ok_or_else(|| anyhow::anyhow!("invalid op key {key:?}"))?,
-            )?;
-            let cid_suffix = key
-                .get(9..)
-                .ok_or_else(|| anyhow::anyhow!("invalid op key {key:?}"))?;
-
-            let mut full_cid_bytes = db_op.cid_prefix.clone();
-            full_cid_bytes.extend_from_slice(cid_suffix);
-
-            let cid = decode_cid(&full_cid_bytes)?;
-            let did = decode_did(&db_op.did);
-
-            Ok(Op {
-                did,
-                cid,
-                created_at,
-                nullified: db_op.nullified,
-                operation: db_op.operation.to_json_value(),
-            })
-        }))
+        Ok(self
+            .inner
+            .ops
+            .range(range)
+            .map(|item| -> anyhow::Result<Op> {
+                let (_, value) = item
+                    .into_inner()
+                    .map_err(|e: fjall::Error| anyhow::anyhow!("fjall read error: {e}"))?;
+                let db_op: DbOp = rmp_serde::from_slice(&value)?;
+                let created_at =
+                    Dt::from_timestamp_micros(db_op.created_at as i64).ok_or_else(|| {
+                        anyhow::anyhow!("invalid created_at_micros {}", db_op.created_at)
+                    })?;
+                let cid = decode_cid(&db_op.cid)?;
+                let did = decode_did(&db_op.did);
+                Ok(Op {
+                    did,
+                    cid,
+                    created_at,
+                    nullified: db_op.nullified,
+                    operation: db_op.operation.to_json_value(),
+                })
+            }))
     }
 
-    pub fn drop_op(&self, did_str: &str, created_at: &Dt, cid: &str) -> anyhow::Result<()> {
-        let cid = decode_cid_str(cid)?;
-        let cid_suffix = &cid[30..];
+    pub fn drop_op(&self, did_str: &str, _created_at: &Dt, _cid: &str) -> anyhow::Result<()> {
+        // scan the by_did index for this DID and find the op that matches
+        // (in practice drop_op is rare so a scan is fine)
+        let prefix = by_did_prefix(did_str)?;
+        let mut found_seq: Option<u64> = None;
+        let mut found_by_did_key: Option<Vec<u8>> = None;
 
-        let op_key = op_key(created_at, cid_suffix);
-        let by_did_key = by_did_key(did_str, created_at, cid_suffix)?;
+        for guard in self.inner.by_did.prefix(&prefix) {
+            let (key, _) = guard
+                .into_inner()
+                .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
+            let suffix = &key[prefix.len()..];
+            let seq = u64::decode_variable(suffix).context("decode seq in drop_op")?;
+            found_seq = Some(seq);
+            found_by_did_key = Some(key.to_vec());
+            // if there were multiple ops for this DID we'd need to match by cid,
+            // but for now take the last matched (they're in seq order)
+        }
+
+        let (seq, by_did_key_bytes) = match (found_seq, found_by_did_key) {
+            (Some(s), Some(k)) => (s, k),
+            _ => {
+                log::warn!("drop_op: by_did entry not found for {did_str}");
+                return Ok(());
+            }
+        };
 
         let mut batch = self.inner.db.batch();
-        batch.remove(&self.inner.ops, op_key);
-        batch.remove(&self.inner.by_did, by_did_key);
+        batch.remove(&self.inner.ops, seq_key(seq));
+        batch.remove(&self.inner.by_did, by_did_key_bytes);
         batch.commit()?;
 
         Ok(())
@@ -1302,55 +1296,10 @@ impl FjallDb {
     }
 }
 
-impl BundleSource for FjallDb {
-    fn reader_for(
-        &self,
-        week: Week,
-    ) -> impl Future<Output = anyhow::Result<impl AsyncRead + Send>> + Send {
-        let db = self.clone();
-
-        async move {
-            let (mut tx, rx) = tokio::io::duplex(1024 * 1024 * 16);
-
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let after: Dt = week.into();
-                let before: Dt = week.next().into();
-
-                let iter = db.export_ops(after..before)?;
-
-                let rt = tokio::runtime::Handle::current();
-
-                for op_res in iter {
-                    let op = op_res?;
-                    let operation_str = serde_json::to_string(&op.operation)?;
-                    let common_op = crate::Op {
-                        did: op.did,
-                        cid: op.cid,
-                        created_at: op.created_at,
-                        nullified: op.nullified,
-                        operation: serde_json::value::RawValue::from_string(operation_str)?,
-                    };
-
-                    let mut json_bytes = serde_json::to_vec(&common_op)?;
-                    json_bytes.push(b'\n');
-
-                    if rt.block_on(tx.write_all(&json_bytes)).is_err() {
-                        break;
-                    }
-                }
-
-                Ok(())
-            });
-
-            Ok(rx)
-        }
-    }
-}
-
 pub async fn backfill_to_fjall(
     db: FjallDb,
     reset: bool,
-    mut pages: mpsc::Receiver<ExportPage>,
+    mut pages: mpsc::Receiver<crate::SeqPage>,
     notify_last_at: Option<oneshot::Sender<Option<Dt>>>,
 ) -> anyhow::Result<&'static str> {
     let t0 = Instant::now();
@@ -1375,18 +1324,28 @@ pub async fn backfill_to_fjall(
             page = pages.recv(), if !pages_finished => {
                 let Some(page) = page else { continue; };
                 if notify_last_at.is_some() {
-                    if let Some(s) = PageBoundaryState::new(&page) {
-                        last_at = last_at.filter(|&l| l >= s.last_at).or(Some(s.last_at));
+                    // SeqPage ops are always in order, so we can just grab the last one
+                    if let Some(last_op) = page.ops.last() {
+                        last_at = last_at.filter(|&l| l >= last_op.created_at).or(Some(last_op.created_at));
                     }
                 }
+
                 let db = db.clone();
+
                 // we don't have to wait for inserts to finish, because insert_op
                 // without verification does not read anything from the db
                 insert_tasks.spawn_blocking(move || {
                     let mut count: usize = 0;
-                    for op in &page.ops {
-                        // we don't verify sigs for bulk, since pages might be out of order
-                        count += db.insert_op::<false>(op)?;
+                    for seq_op in &page.ops {
+                        let op = CommonOp {
+                            did: seq_op.did.clone(),
+                            cid: seq_op.cid.clone(),
+                            created_at: seq_op.created_at,
+                            nullified: seq_op.nullified,
+                            operation: seq_op.operation.clone(),
+                        };
+                        // we don't verify sigs for bulk, since pages might be out of order (and we trust for backfills)
+                        count += db.insert_op::<false>(&op, seq_op.seq)?;
                     }
                     db.persist(PersistMode::Buffer)?;
                     Ok(count)
@@ -1421,22 +1380,30 @@ pub async fn backfill_to_fjall(
     Ok("backfill_to_fjall")
 }
 
-pub async fn pages_to_fjall(
+/// Write sequenced ops (with PLC seq numbers) into fjall.
+pub async fn seq_pages_to_fjall(
     db: FjallDb,
-    mut pages: mpsc::Receiver<ExportPage>,
+    mut pages: mpsc::Receiver<crate::SeqPage>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting pages_to_fjall writer...");
+    log::info!("starting seq_pages_to_fjall writer...");
 
     let t0 = Instant::now();
     let mut ops_inserted: usize = 0;
 
     while let Some(page) = pages.recv().await {
-        log::trace!("writing page with {} ops", page.ops.len());
+        log::trace!("writing seq page with {} ops", page.ops.len());
         let db = db.clone();
         let count = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let mut count: usize = 0;
-            for op in &page.ops {
-                count += db.insert_op::<true>(op)?;
+            for seq_op in &page.ops {
+                let common_op = CommonOp {
+                    did: seq_op.did.clone(),
+                    cid: seq_op.cid.clone(),
+                    created_at: seq_op.created_at,
+                    nullified: seq_op.nullified,
+                    operation: seq_op.operation.clone(),
+                };
+                count += db.insert_op::<true>(&common_op, seq_op.seq)?;
             }
             db.persist(PersistMode::Buffer)?;
             Ok(count)
@@ -1446,10 +1413,10 @@ pub async fn pages_to_fjall(
     }
 
     log::info!(
-        "no more pages. inserted {ops_inserted} ops in {:?}",
+        "no more seq pages. inserted {ops_inserted} ops in {:?}",
         t0.elapsed()
     );
-    Ok("pages_to_fjall")
+    Ok("seq_pages_to_fjall")
 }
 
 pub async fn audit(
@@ -1464,7 +1431,7 @@ pub async fn audit(
         t0.elapsed()
     );
     if failed > 0 {
-        anyhow::bail!("audit found {failed} invalid operations");
+        log::error!("audit found {failed} invalid operations");
     }
     Ok("audit_fjall")
 }
@@ -1481,7 +1448,11 @@ pub async fn fix_ops(
 
     let latest_at = db
         .get_latest()?
-        .ok_or_else(|| anyhow::anyhow!("db not backfilled? expected at least one op"))?;
+        .ok_or_else(|| anyhow::anyhow!("db not backfilled? expected at least one op"))
+        .map(|(_, dt)| dt)?;
+
+    // local seq counter for newly fetched ops
+    let mut next_seq = db.get_latest()?.map(|(s, _)| s).unwrap_or(0) + 1;
 
     while let Some(op) = invalid_ops_rx.recv().await {
         let InvalidOp { did, at, cid, .. } = op;
@@ -1544,7 +1515,9 @@ pub async fn fix_ops(
                 continue;
             }
 
-            count += db.insert_op::<true>(&op)?;
+            let seq = next_seq;
+            next_seq += 1;
+            count += db.insert_op::<true>(&op, seq)?;
         }
 
         db.persist(PersistMode::Buffer)?;

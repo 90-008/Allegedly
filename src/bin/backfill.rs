@@ -1,8 +1,8 @@
 use allegedly::{
-    Db, Dt, ExportPage, FjallDb, FolderSource, HttpSource, backfill, backfill_to_fjall,
-    backfill_to_pg,
+    Db, Dt, ExportPage, FjallDb, FolderSource, HttpSource, SeqPage, backfill, backfill_to_pg,
     bin::{GlobalArgs, bin_init},
-    full_pages, logo, pages_to_fjall, pages_to_pg, pages_to_stdout, poll_upstream,
+    full_pages, full_pages_seq, logo, pages_to_pg, pages_to_stdout, poll_upstream,
+    poll_upstream_seq, seq_pages_to_fjall,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -23,9 +23,6 @@ pub struct Args {
     /// Local folder to fetch bundles from (overrides `http`)
     #[arg(long)]
     dir: Option<PathBuf>,
-    /// Local fjall database to fetch raw ops from (overrides `http` and `dir`)
-    #[arg(long, conflicts_with_all = ["dir"])]
-    from_fjall: Option<PathBuf>,
     /// Don't do weekly bulk-loading at all.
     ///
     /// overrides `http` and `dir`, makes catch_up redundant
@@ -49,7 +46,8 @@ pub struct Args {
     /// only used if `--to-postgres` or `--to-fjall` is present
     #[arg(long, action)]
     reset: bool,
-    /// Bulk load into a local fjall embedded database
+    /// Load into a local fjall embedded database
+    /// (doesnt support bulk yet unless loading from another fjall db)
     ///
     /// Pass a directory path for the fjall database
     #[arg(long, conflicts_with_all = ["to_postgres", "postgres_cert"])]
@@ -70,7 +68,6 @@ pub async fn run(
     Args {
         http,
         dir,
-        from_fjall,
         no_bulk,
         source_workers,
         to_postgres,
@@ -95,7 +92,7 @@ pub async fn run(
     };
 
     let (poll_tx, poll_out) = mpsc::channel::<ExportPage>(128); // normal/small pages
-    let (full_tx, full_out) = mpsc::channel(1); // don't need to buffer at this filter
+    let (full_tx, full_out) = mpsc::channel::<ExportPage>(1); // don't need to buffer at this filter
 
     // set up sources
     if no_bulk {
@@ -114,27 +111,27 @@ pub async fn run(
         let mut upstream = upstream;
         upstream.set_path("/export");
         let throttle = Duration::from_millis(upstream_throttle_ms);
-        tasks.spawn(poll_upstream(None, upstream, throttle, poll_tx));
-        tasks.spawn(full_pages(poll_out, full_tx));
         if let Some(fjall_path) = to_fjall {
             log::trace!("opening fjall db at {fjall_path:?}...");
             let db = FjallDb::open(&fjall_path)?;
             log::trace!("opened fjall db");
 
-            tasks.spawn(pages_to_fjall(db, full_out));
+            let (poll_tx, poll_out) = mpsc::channel::<SeqPage>(128); // normal/small pages
+            let (full_tx, full_out) = mpsc::channel::<SeqPage>(1); // don't need to buffer at this filter
+
+            tasks.spawn(poll_upstream_seq(None, upstream, throttle, poll_tx));
+            tasks.spawn(full_pages_seq(poll_out, full_tx));
+            tasks.spawn(seq_pages_to_fjall(db, full_out));
         } else {
+            tasks.spawn(poll_upstream(None, upstream, throttle, poll_tx));
+            tasks.spawn(full_pages(poll_out, full_tx));
             tasks.spawn(pages_to_stdout(full_out, None));
         }
     } else {
         // fun mode
 
         // set up bulk sources
-        if let Some(fjall_path) = from_fjall {
-            log::trace!("opening source fjall db at {fjall_path:?}...");
-            let db = FjallDb::open(&fjall_path)?;
-            log::trace!("opened source fjall db");
-            tasks.spawn(backfill(db, bulk_tx, source_workers.unwrap_or(4), until));
-        } else if let Some(dir) = dir {
+        if let Some(dir) = dir {
             if http != DEFAULT_HTTP.parse()? {
                 anyhow::bail!(
                     "non-default bulk http setting can't be used with bulk dir setting ({dir:?})"
@@ -167,21 +164,7 @@ pub async fn run(
         }
 
         // set up sinks
-        if let Some(fjall_path) = to_fjall {
-            log::trace!("opening fjall db at {fjall_path:?}...");
-            let db = FjallDb::open(&fjall_path)?;
-            log::trace!("opened fjall db");
-
-            tasks.spawn(backfill_to_fjall(
-                db.clone(),
-                reset,
-                bulk_out,
-                found_last_tx,
-            ));
-            if catch_up {
-                tasks.spawn(pages_to_fjall(db, full_out));
-            }
-        } else if let Some(pg_url) = to_postgres {
+        if let Some(pg_url) = to_postgres {
             log::trace!("connecting to postgres...");
             let db = Db::new(pg_url.as_str(), postgres_cert).await?;
             log::trace!("connected to postgres");
