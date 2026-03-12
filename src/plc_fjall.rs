@@ -12,7 +12,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
 
 const SEP: u8 = 0;
 
@@ -829,8 +829,9 @@ struct DbOp {
 }
 
 // we have our own Op struct for fjall since we dont want to have to convert Value back to RawValue
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Op {
+    pub seq: u64,
     pub did: String,
     pub cid: String,
     pub created_at: Dt,
@@ -849,6 +850,7 @@ struct FjallInner {
     ops: Keyspace,
     /// secondary index: [encoded_did][SEP][seq_varint] -> []
     by_did: Keyspace,
+    notify_stream: Notify,
 }
 
 impl FjallDb {
@@ -880,12 +882,17 @@ impl FjallDb {
         let by_did = db.keyspace("by_did", || {
             opts()
                 .max_memtable_size(mb(64))
-                // this isn't gonna compress well anyway, since its just keys (did + timestamp + cid)
+                // this isn't gonna compress well anyway, since its just keys (did + seq)
                 // and dids dont have many operations in the first place, so we can use small blocks
                 .data_block_size_policy(BlockSizePolicy::all(kb(2)))
         })?;
         Ok(Self {
-            inner: Arc::new(FjallInner { db, ops, by_did }),
+            inner: Arc::new(FjallInner {
+                db,
+                ops,
+                by_did,
+                notify_stream: Notify::new(),
+            }),
         })
     }
 
@@ -903,6 +910,10 @@ impl FjallDb {
         self.inner.ops.major_compact()?;
         self.inner.by_did.major_compact()?;
         Ok(())
+    }
+
+    pub fn subscribe(&self) -> Notified<'_> {
+        self.inner.notify_stream.notified()
     }
 
     /// Returns `(seq, created_at)` for the last stored op, or `None` if empty.
@@ -950,7 +961,7 @@ impl FjallDb {
                     self._ops_for_did(&op.did)
                         .map(|ops| {
                             ops.rev()
-                                .find(|r| r.as_ref().map_or(true, |(_, cid, _)| cid == prev_cid))
+                                .find(|r| r.as_ref().map_or(true, |(_, _, cid, _)| cid == prev_cid))
                                 .transpose()
                         })
                         .flatten()
@@ -958,7 +969,7 @@ impl FjallDb {
                 .transpose()?
                 .flatten();
 
-            let prev_stored = prev_op.as_ref().map(|(_, _, p)| &p.operation);
+            let prev_stored = prev_op.as_ref().map(|(_, _, _, p)| &p.operation);
 
             match verify_op_sig(&operation, prev_stored) {
                 Ok(results) => {
@@ -1002,18 +1013,42 @@ impl FjallDb {
         batch.insert(&self.inner.by_did, by_did_key_bytes, &[]);
         batch.commit()?;
 
+        self.inner.notify_stream.notify_waiters();
+
         Ok(1)
     }
-}
 
-impl FjallDb {
+    pub(crate) fn get_op_at_or_after(&self, seq: u64) -> anyhow::Result<Option<Op>> {
+        self.inner
+            .ops
+            .range(seq_key(seq)..)
+            .next()
+            .map(|v| {
+                rmp_serde::from_slice::<DbOp>(&v.value()?)
+                    .context("failed to decode op")
+                    .map(|op| {
+                        Ok(Op {
+                            seq,
+                            did: decode_did(&op.did),
+                            cid: decode_cid(&op.cid)?,
+                            created_at: Dt::from_timestamp_micros(op.created_at as i64)
+                                .ok_or_else(|| anyhow::anyhow!("invalid created_at in op"))?,
+                            nullified: op.nullified,
+                            operation: op.operation.to_json_value(),
+                        })
+                    })
+                    .flatten()
+            })
+            .transpose()
+    }
+
     /// Decode a `by_did` entry: extract the seq from the key suffix, then
     /// look up the full `DbOp` in the `ops` keyspace.
     fn decode_by_did_entry(
         &self,
         by_did_key_bytes: &[u8],
         prefix_len: usize,
-    ) -> anyhow::Result<(Dt, PlcCid, DbOp)> {
+    ) -> anyhow::Result<(u64, Dt, PlcCid, DbOp)> {
         let key_suffix = by_did_key_bytes
             .get(prefix_len..)
             .ok_or_else(|| anyhow::anyhow!("invalid by_did key {by_did_key_bytes:?}"))?;
@@ -1032,13 +1067,13 @@ impl FjallDb {
             .ok_or_else(|| anyhow::anyhow!("invalid created_at_micros {}", op.created_at))?;
         let cid = PlcCid(op.cid.clone());
 
-        Ok((ts, cid, op))
+        Ok((seq, ts, cid, op))
     }
 
     fn _ops_for_did(
         &self,
         did: &str,
-    ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<(Dt, PlcCid, DbOp)>> + '_>
+    ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<(u64, Dt, PlcCid, DbOp)>> + '_>
     {
         let prefix = by_did_prefix(did)?;
 
@@ -1055,10 +1090,11 @@ impl FjallDb {
         did: &str,
     ) -> anyhow::Result<impl DoubleEndedIterator<Item = anyhow::Result<Op>> + '_> {
         Ok(self._ops_for_did(did)?.map(|res| {
-            let (ts, cid, op) = res?;
+            let (seq, ts, cid, op) = res?;
             let cid = decode_cid(&cid.0)?;
             let did = decode_did(&op.did);
             Ok(Op {
+                seq,
                 did,
                 cid,
                 created_at: ts,
@@ -1087,9 +1123,10 @@ impl FjallDb {
             .ops
             .range(range)
             .map(|item| -> anyhow::Result<Op> {
-                let (_, value) = item
+                let (key, value) = item
                     .into_inner()
                     .map_err(|e: fjall::Error| anyhow::anyhow!("fjall read error: {e}"))?;
+                let seq = decode_seq_key(&key)?;
                 let db_op: DbOp = rmp_serde::from_slice(&value)?;
                 let created_at =
                     Dt::from_timestamp_micros(db_op.created_at as i64).ok_or_else(|| {
@@ -1098,6 +1135,7 @@ impl FjallDb {
                 let cid = decode_cid(&db_op.cid)?;
                 let did = decode_did(&db_op.did);
                 Ok(Op {
+                    seq,
                     did,
                     cid,
                     created_at,
@@ -1257,7 +1295,7 @@ impl FjallDb {
                                 current_prefix = Some(prefix_array);
                             }
 
-                            did_ops.push(op);
+                            did_ops.push((op.1, op.2, op.3));
                             processed_ops += 1;
                         }
 

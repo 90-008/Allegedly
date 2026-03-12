@@ -27,7 +27,7 @@ native-tls = "0.2.14"
 opentelemetry = "0.30.0"
 opentelemetry-otlp = { version = "0.30.0" }
 opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
-poem = { version = "3.1.12", features = ["acme", "compression"] }
+poem = { version = "3.1.12", features = ["acme", "compression", "test", "websocket"] }
 postgres-native-tls = "0.5.1"
 reqwest = { version = "0.12.23", features = ["stream", "json", "gzip"] }
 reqwest-middleware = "0.4.2"

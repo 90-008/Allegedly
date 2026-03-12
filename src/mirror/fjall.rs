@@ -1,7 +1,22 @@
+use std::sync::Arc;
+
 use super::*;
-use futures::StreamExt;
+use futures::{SinkExt as _, StreamExt as _};
+use poem::IntoResponse;
 use poem::web::Query;
 use serde::Deserialize;
+
+async fn spawn_blocking<F, R>(f: F) -> poem::Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce() -> anyhow::Result<R> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(anyhow::Error::from)
+        .flatten()
+        .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))
+}
 
 #[derive(Clone)]
 struct FjallState {
@@ -145,13 +160,11 @@ async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<
 
     let did = did.to_string();
     let db = state.fjall.clone();
-    let ops = tokio::task::spawn_blocking(move || {
+    let ops = spawn_blocking(move || {
         let iter = db.ops_for_did(&did)?;
         iter.collect::<anyhow::Result<Vec<_>>>()
     })
-    .await
-    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
+    .await?;
 
     if ops.is_empty() {
         return Err(Error::from_string(
@@ -256,7 +269,7 @@ struct ExportQuery {
 }
 
 #[handler]
-async fn fjall_export(
+async fn export(
     _req: &Request,
     Query(query): Query<ExportQuery>,
     Data(FjallState { fjall, .. }): Data<&FjallState>,
@@ -265,13 +278,11 @@ async fn fjall_export(
     let limit = 1000;
     let db = fjall.clone();
 
-    let ops = tokio::task::spawn_blocking(move || {
+    let ops = spawn_blocking(move || {
         let iter = db.export_ops(after..)?;
         iter.take(limit).collect::<anyhow::Result<Vec<_>>>()
     })
-    .await
-    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-    .map_err(|e| Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
+    .await?;
 
     let stream = futures::stream::iter(ops).map(|op| {
         let mut json = serde_json::to_string(&op).unwrap();
@@ -280,6 +291,111 @@ async fn fjall_export(
     });
 
     Ok(Body::from_bytes_stream(stream))
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    cursor: Option<u64>,
+}
+
+#[handler]
+async fn export_stream(
+    _req: &Request,
+    Query(query): Query<StreamQuery>,
+    ws: poem::web::websocket::WebSocket,
+    Data(FjallState { fjall, .. }): Data<&FjallState>,
+) -> poem::Result<impl IntoResponse> {
+    use poem::web::websocket::Message;
+    use tokio::sync::Notify;
+
+    let db = fjall.clone();
+
+    let latest_cursor = spawn_blocking({
+        let db = db.clone();
+        move || db.get_latest().map(|res| res.map(|(c, _)| c))
+    })
+    .await?
+    .unwrap_or(0);
+
+    let mut cursor = match query.cursor {
+        Some(cursor) => {
+            if cursor > latest_cursor {
+                return Err(Error::from_string(
+                    format!("cursor {cursor} is in the future"),
+                    StatusCode::BAD_REQUEST,
+                ));
+            }
+
+            let created_at = spawn_blocking({
+                let db = db.clone();
+                move || {
+                    db.get_op_at_or_after(cursor)
+                        .map(|res| res.map(|op| op.created_at))
+                }
+            })
+            .await?;
+
+            match created_at {
+                Some(created_at) => {
+                    // check that the provided cursor is not stale
+                    if (chrono::Utc::now() - created_at).num_days() > 1 {
+                        return Err(Error::from_string(
+                            format!("cursor {cursor} is stale, catch up using /export first"),
+                            StatusCode::BAD_REQUEST,
+                        ));
+                    }
+                    cursor
+                }
+                None => latest_cursor,
+            }
+        }
+        None => {
+            // if cursor is not provided, start at the latest op
+            latest_cursor
+        }
+    };
+
+    Ok(ws.on_upgrade(move |mut socket| async move {
+        let errored = Arc::new(Notify::new());
+
+        loop {
+            let (tx, mut op_rx) = tokio::sync::mpsc::channel(64);
+
+            tokio::task::spawn_blocking({
+                let db = db.clone();
+                let errored = errored.clone();
+                move || {
+                    let iter = match db.export_ops(cursor..) {
+                        Ok(it) => it,
+                        Err(e) => {
+                            log::error!("read failed: {e}");
+                            errored.notify_one();
+                            return;
+                        }
+                    };
+                    for op in iter.flatten() {
+                        if tx.blocking_send(op).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            while let Some(op) = op_rx.recv().await {
+                cursor = op.seq;
+                let json = serde_json::to_string(&op).unwrap();
+                if let Err(e) = socket.send(Message::Text(json)).await {
+                    log::warn!("closing export stream: {e}");
+                    return;
+                }
+            }
+
+            tokio::select! {
+                _ = db.subscribe() => {},
+                _ = errored.notified() => return,
+            }
+        }
+    }))
 }
 
 #[handler]
@@ -334,7 +450,8 @@ pub async fn serve_fjall(
         .at("/", get(fjall_hello))
         .at("/favicon.ico", get(favicon))
         .at("/_health", get(fjall_health))
-        .at("/export", get(fjall_export));
+        .at("/export", get(export))
+        .at("/export/stream", get(export_stream));
 
     if experimental.write_upstream {
         log::info!("enabling experimental write forwarding to upstream");
