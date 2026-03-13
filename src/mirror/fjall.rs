@@ -276,13 +276,21 @@ async fn export(
     let limit = 1000;
     let db = fjall.clone();
 
-    let ops = spawn_blocking(move || {
-        let iter = db.export_ops((after + 1)..)?;
-        iter.take(limit).collect::<anyhow::Result<Vec<_>>>()
-    })
-    .await?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<_>>(64);
 
-    let stream = futures::stream::iter(ops).map(|op| {
+    tokio::task::spawn_blocking(move || {
+        let iter = db.export_ops((after + 1)..)?;
+        for op in iter.take(limit) {
+            if tx.blocking_send(op).is_err() {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    });
+
+    // todo: its a bit annoying that errors just cut it off here...
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|result| {
+        let op = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let mut json = serde_json::to_string(&op.to_sequenced_json()).unwrap();
         json.push('\n');
         Ok::<_, std::io::Error>(json)
