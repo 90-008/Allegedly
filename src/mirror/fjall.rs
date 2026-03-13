@@ -353,6 +353,7 @@ async fn export_stream(
             latest_cursor
         }
     };
+    cursor += 1; // make cursor exclusive
 
     Ok(ws.on_upgrade(move |mut socket| async move {
         loop {
