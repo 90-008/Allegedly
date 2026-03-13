@@ -285,7 +285,7 @@ async fn export(
     .await?;
 
     let stream = futures::stream::iter(ops).map(|op| {
-        let mut json = serde_json::to_string(&op).unwrap();
+        let mut json = serde_json::to_string(&op.to_sequenced_json()).unwrap();
         json.push('\n');
         Ok::<_, std::io::Error>(json)
     });
@@ -340,7 +340,9 @@ async fn export_stream(
                     // check that the provided cursor is not stale
                     if (chrono::Utc::now() - created_at).num_days() > 1 {
                         return Err(Error::from_string(
-                            format!("cursor {cursor} is stale, catch up using /export first"),
+                            format!(
+                                "cursor {cursor} is stale (older than a day), catch up using /export first"
+                            ),
                             StatusCode::BAD_REQUEST,
                         ));
                     }
@@ -382,12 +384,12 @@ async fn export_stream(
             });
 
             while let Some(op) = op_rx.recv().await {
-                cursor = op.seq;
-                let json = serde_json::to_string(&op).unwrap();
+                let json = serde_json::to_string(&op.to_sequenced_json()).unwrap();
                 if let Err(e) = socket.send(Message::Text(json)).await {
                     log::warn!("closing export stream: {e}");
                     return;
                 }
+                cursor = op.seq;
             }
 
             tokio::select! {

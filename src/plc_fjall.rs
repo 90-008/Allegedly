@@ -834,9 +834,21 @@ pub struct Op {
     pub seq: u64,
     pub did: String,
     pub cid: String,
+    #[serde(rename = "createdAt")]
     pub created_at: Dt,
     pub nullified: bool,
     pub operation: serde_json::Value,
+}
+
+impl Op {
+    /// adds the `type` field to the op
+    pub fn to_sequenced_json(&self) -> serde_json::Value {
+        let mut val = serde_json::to_value(self).expect("Op is serializable");
+        if let serde_json::Value::Object(ref mut map) = val {
+            map.insert("type".to_string(), "sequenced_op".into());
+        }
+        val
+    }
 }
 
 #[derive(Clone)]
@@ -1313,8 +1325,10 @@ impl FjallDb {
 
             // we can start two threads, one for forward iteration and one for reverse iteration
             // this way we have two scans in parallel which should be faster!
-            let f_handle = spawn_scan_thread!(next, 0, false, ops / 2);
-            let b_handle = spawn_scan_thread!(next_back, workers / 2, true, ops - (ops / 2));
+            let f_count = ops / 2;
+            let f_handle = spawn_scan_thread!(next, 0, false, f_count);
+            let b_count = ops - f_count;
+            let b_handle = spawn_scan_thread!(next_back, workers / 2, true, b_count);
 
             f_handle.join().unwrap()?;
             b_handle.join().unwrap()?;
