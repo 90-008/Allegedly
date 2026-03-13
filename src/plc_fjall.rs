@@ -76,7 +76,8 @@ fn by_did_key(did: &str, seq: u64) -> anyhow::Result<Vec<u8>> {
 }
 
 /// CID string → binary CID bytes
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// STABILITY: never reorder variants, only append.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
 struct PlcCid(#[serde(with = "serde_bytes")] Vec<u8>);
 
 impl PlcCid {
@@ -96,11 +97,12 @@ impl fmt::Display for PlcCid {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// STABILITY: never reorder variants, only append.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
 enum Aka {
-    Bluesky(String),
-    Atproto(String),
-    Other(String),
+    Other(String),   // 0
+    Bluesky(String), // 1
+    Atproto(String), // 2
 }
 
 impl Aka {
@@ -127,13 +129,14 @@ impl fmt::Display for Aka {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// STABILITY: never reorder variants, only append.
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "snake_case")]
 enum OpType {
-    PlcOperation,
-    Create,
-    PlcTombstone,
-    Other(String),
+    Other(String), // 0
+    PlcOperation,  // 1
+    Create,        // 2
+    PlcTombstone,  // 3
 }
 
 impl OpType {
@@ -220,10 +223,22 @@ enum StoredOpError {
     TypeMismatch(StoredOpField, &'static str),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+// STABILITY: never reorder variants, only append.
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 enum VerificationMethodKey {
-    Atproto,
-    Other(String),
+    Other(String), // 0
+    Atproto,       // 1
 }
 
 impl VerificationMethodKey {
@@ -248,10 +263,22 @@ impl fmt::Display for VerificationMethodKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+// STABILITY: never reorder variants, only append.
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 enum ServiceKey {
-    AtprotoPds,
-    Other(String),
+    Other(String), // 0
+    AtprotoPds,    // 1
 }
 
 impl ServiceKey {
@@ -276,10 +303,11 @@ impl fmt::Display for ServiceKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// STABILITY: never reorder variants, only append.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
 enum ServiceType {
-    AtprotoPersonalDataServer,
-    Other(String),
+    Other(String),             // 0
+    AtprotoPersonalDataServer, // 1
 }
 
 impl ServiceType {
@@ -298,11 +326,12 @@ impl ServiceType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// STABILITY: never reorder variants, only append.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
 enum ServiceEndpoint {
-    BlueskyPds(String),
-    Other(String),
-    BlueskySocial,
+    Other(String),      // 0
+    BlueskyPds(String), // 1
+    BlueskySocial,      // 2
 }
 
 impl ServiceEndpoint {
@@ -328,13 +357,13 @@ impl ServiceEndpoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct StoredService {
     r#type: ServiceType,
     endpoint: ServiceEndpoint,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct StoredOp {
     op_type: OpType,
     sig: Signature,
@@ -351,8 +380,11 @@ struct StoredOp {
     handle: Option<String>,
     service: Option<String>,
 
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    unknown: BTreeMap<String, serde_json::Value>,
+    // msgpack-encoded BTreeMap<String, serde_json::Value>.
+    // Vec<u8> is used because bitcode cannot handle serde_json::Value directly.
+    // empty vec when there are no unknown fields (the common case).
+    #[serde(skip)]
+    unknown_packed: Vec<u8>,
 }
 
 impl StoredOp {
@@ -370,6 +402,20 @@ impl StoredOp {
             }
         }
         keys
+    }
+
+    fn unknown(&self) -> BTreeMap<String, serde_json::Value> {
+        if self.unknown_packed.is_empty() {
+            return BTreeMap::new();
+        }
+        rmp_serde::from_slice(&self.unknown_packed).unwrap_or_default()
+    }
+
+    fn pack_unknown(unknown: BTreeMap<String, serde_json::Value>) -> Vec<u8> {
+        if unknown.is_empty() {
+            return Vec::new();
+        }
+        rmp_serde::to_vec(&unknown).expect("unknown fields are serializable")
     }
     fn from_json_value(v: serde_json::Value) -> (Option<Self>, Vec<StoredOpError>) {
         let serde_json::Value::Object(mut obj) = v else {
@@ -698,7 +744,7 @@ impl StoredOp {
                 recovery_key,
                 handle,
                 service,
-                unknown,
+                unknown_packed: Self::pack_unknown(unknown),
             }),
             errors,
         )
@@ -780,8 +826,8 @@ impl StoredOp {
             map.insert((*StoredOpField::Service).into(), service.clone().into());
         }
 
-        for (k, v) in &self.unknown {
-            map.insert(k.clone(), v.clone());
+        for (k, v) in self.unknown() {
+            map.insert(k, v);
         }
 
         serde_json::Value::Object(map)
@@ -816,7 +862,7 @@ fn verify_op_sig(op: &StoredOp, prev: Option<&StoredOp>) -> anyhow::Result<Assur
 
 // stored alongside the seq key in the ops keyspace
 // cid and created_at are in the value (not the key) in the new layout
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 struct DbOp {
     #[serde(with = "serde_bytes")]
@@ -938,7 +984,7 @@ impl FjallDb {
             .into_inner()
             .map_err(|e| anyhow::anyhow!("fjall read error: {e}"))?;
         let seq = decode_seq_key(&key)?;
-        let db_op: DbOp = rmp_serde::from_slice(&value)?;
+        let db_op: DbOp = bitcode::decode::<DbOp>(&value)?;
         let dt = Dt::from_timestamp_micros(db_op.created_at as i64)
             .ok_or_else(|| anyhow::anyhow!("invalid created_at in last op"))?;
         Ok(Some((seq, dt)))
@@ -1017,7 +1063,7 @@ impl FjallDb {
             operation,
         };
 
-        let seq_val = rmp_serde::to_vec(&db_op)?;
+        let seq_val = bitcode::encode(&db_op);
         let seq_key_bytes = seq_key(seq);
         let by_did_key_bytes = by_did_key(&op.did, seq)?;
 
@@ -1037,7 +1083,7 @@ impl FjallDb {
             .range(seq_key(seq)..)
             .next()
             .map(|v| {
-                rmp_serde::from_slice::<DbOp>(&v.value()?)
+                bitcode::decode::<DbOp>(&v.value()?)
                     .context("failed to decode op")
                     .map(|op| {
                         Ok(Op {
@@ -1075,7 +1121,7 @@ impl FjallDb {
             .get(seq_key(seq))?
             .ok_or_else(|| anyhow::anyhow!("op not found for seq {seq}"))?;
 
-        let op: DbOp = rmp_serde::from_slice(&value)?;
+        let op: DbOp = bitcode::decode::<DbOp>(&value)?;
         let ts = Dt::from_timestamp_micros(op.created_at as i64)
             .ok_or_else(|| anyhow::anyhow!("invalid created_at_micros {}", op.created_at))?;
         let cid = PlcCid(op.cid.clone());
@@ -1140,7 +1186,7 @@ impl FjallDb {
                     .into_inner()
                     .map_err(|e: fjall::Error| anyhow::anyhow!("fjall read error: {e}"))?;
                 let seq = decode_seq_key(&key)?;
-                let db_op: DbOp = rmp_serde::from_slice(&value)?;
+                let db_op: DbOp = bitcode::decode::<DbOp>(&value)?;
                 let created_at =
                     Dt::from_timestamp_micros(db_op.created_at as i64).ok_or_else(|| {
                         anyhow::anyhow!("invalid created_at_micros {}", db_op.created_at)
@@ -1696,9 +1742,10 @@ mod tests {
                     msg.push_str(&format!("op: {op}\n"));
                     panic!("{msg}");
                 }
+                let stored = stored.unwrap();
 
-                let packed = rmp_serde::to_vec(&stored).unwrap();
-                let unpacked: StoredOp = rmp_serde::from_slice(&packed).unwrap();
+                let packed = bitcode::encode(&stored);
+                let unpacked: StoredOp = bitcode::decode::<StoredOp>(&packed).unwrap();
 
                 let reconstructed = unpacked.to_json_value();
                 assert_eq!(*op, reconstructed, "roundtrip mismatch in {path}");
@@ -1709,7 +1756,7 @@ mod tests {
         }
 
         println!(
-            "json size: {} bytes, msgpack size: {} bytes, saved: {} bytes",
+            "json size: {} bytes, bitcode size: {} bytes, saved: {} bytes",
             total_json_size,
             total_packed_size,
             total_json_size as isize - total_packed_size as isize

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// base64url-encoded ECDSA signature → raw bytes
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct Signature(#[serde(with = "serde_bytes")] pub Vec<u8>);
 
 impl Signature {
@@ -22,7 +22,7 @@ impl fmt::Display for Signature {
 }
 
 /// did:key:z... → raw multicodec public key bytes
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct DidKey(#[serde(with = "serde_bytes")] pub Vec<u8>);
 
 impl DidKey {
