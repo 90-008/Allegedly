@@ -199,8 +199,7 @@ mod tests {
 
                 assert!(
                     !valid_keys.is_empty(),
-                    "no keys to verify against for {}",
-                    path
+                    "{path}/{cid}: no keys to verify against"
                 );
 
                 let results = assure_valid_sig(&valid_keys, &sig, &data)

@@ -1,8 +1,9 @@
 use allegedly::{
-    Db, Dt, ExportPage, FjallDb, FolderSource, HttpSource, SeqPage, backfill, backfill_to_pg,
+    Db, Dt, ExportPage, FjallDb, FolderSource, HttpSource, SeqPage, backfill, backfill_to_fjall,
+    backfill_to_pg,
     bin::{GlobalArgs, bin_init},
     full_pages, full_pages_seq, logo, pages_to_pg, pages_to_stdout, poll_upstream,
-    poll_upstream_seq, seq_pages_to_fjall,
+    poll_upstream_seq,
 };
 use clap::Parser;
 use reqwest::Url;
@@ -121,7 +122,7 @@ pub async fn run(
 
             tasks.spawn(poll_upstream_seq(None, upstream, throttle, poll_tx));
             tasks.spawn(full_pages_seq(poll_out, full_tx));
-            tasks.spawn(seq_pages_to_fjall(db, full_out));
+            tasks.spawn(backfill_to_fjall(db, reset, full_out, None));
         } else {
             tasks.spawn(poll_upstream(None, upstream, throttle, poll_tx));
             tasks.spawn(full_pages(poll_out, full_tx));

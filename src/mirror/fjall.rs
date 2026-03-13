@@ -277,7 +277,7 @@ async fn export(
     let db = fjall.clone();
 
     let ops = spawn_blocking(move || {
-        let iter = db.export_ops(after..)?;
+        let iter = db.export_ops((after + 1)..)?;
         iter.take(limit).collect::<anyhow::Result<Vec<_>>>()
     })
     .await?;
