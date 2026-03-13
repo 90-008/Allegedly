@@ -357,6 +357,30 @@ impl ServiceEndpoint {
     }
 }
 
+// STABILITY: never reorder variants, only append.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+enum Handle {
+    Other(String),    // 0
+    BskySocial(String), // 1
+}
+
+impl Handle {
+    fn from_str(s: &str) -> Self {
+        if let Some(handle) = s.strip_suffix(".bsky.social") {
+            Self::BskySocial(handle.to_string())
+        } else {
+            Self::Other(s.to_string())
+        }
+    }
+
+    fn as_string(&self) -> String {
+        match self {
+            Self::BskySocial(h) => format!("{h}.bsky.social"),
+            Self::Other(s) => s.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct StoredService {
     r#type: ServiceType,
@@ -377,8 +401,8 @@ struct StoredOp {
     // legacy create fields
     signing_key: Option<DidKey>,
     recovery_key: Option<DidKey>,
-    handle: Option<String>,
-    service: Option<String>,
+    handle: Option<Handle>,
+    service: Option<ServiceEndpoint>,
 
     // msgpack-encoded BTreeMap<String, serde_json::Value>.
     // Vec<u8> is used because bitcode cannot handle serde_json::Value directly.
@@ -705,7 +729,7 @@ impl StoredOp {
         };
 
         let handle = match obj.remove(&*StoredOpField::Handle) {
-            Some(serde_json::Value::String(s)) => Some(s),
+            Some(serde_json::Value::String(s)) => Some(Handle::from_str(&s)),
             Some(v) => {
                 errors.push(StoredOpError::TypeMismatch(StoredOpField::Handle, "string"));
                 unknown.insert(StoredOpField::Handle.to_string(), v);
@@ -715,7 +739,7 @@ impl StoredOp {
         };
 
         let service = match obj.remove(&*StoredOpField::Service) {
-            Some(serde_json::Value::String(s)) => Some(s),
+            Some(serde_json::Value::String(s)) => Some(ServiceEndpoint::from_str(&s)),
             Some(v) => {
                 errors.push(StoredOpError::TypeMismatch(
                     StoredOpField::Service,
@@ -820,10 +844,10 @@ impl StoredOp {
             map.insert((*StoredOpField::RecoveryKey).into(), key.to_string().into());
         }
         if let Some(handle) = &self.handle {
-            map.insert((*StoredOpField::Handle).into(), handle.clone().into());
+            map.insert((*StoredOpField::Handle).into(), handle.as_string().into());
         }
         if let Some(service) = &self.service {
-            map.insert((*StoredOpField::Service).into(), service.clone().into());
+            map.insert((*StoredOpField::Service).into(), service.as_string().into());
         }
 
         for (k, v) in self.unknown() {
@@ -1640,24 +1664,38 @@ mod tests {
     }
 
     #[test]
-    fn bsky_handle_roundtrip() {
+    fn bsky_aka_roundtrip() {
         let h = Aka::from_str("at://alice.bsky.social");
         assert_eq!(h, Aka::Bluesky("alice".to_string()));
         assert_eq!(h.to_string(), "at://alice.bsky.social");
     }
 
     #[test]
-    fn atproto_handle_roundtrip() {
+    fn atproto_aka_roundtrip() {
         let h = Aka::from_str("at://alice.example.com");
         assert_eq!(h, Aka::Atproto("alice.example.com".to_string()));
         assert_eq!(h.to_string(), "at://alice.example.com");
     }
 
     #[test]
-    fn other_handle_roundtrip() {
+    fn other_aka_roundtrip() {
         let h = Aka::from_str("https://something.else");
         assert_eq!(h, Aka::Other("https://something.else".to_string()));
         assert_eq!(h.to_string(), "https://something.else");
+    }
+
+    #[test]
+    fn handle_bsky_social_roundtrip() {
+        let h = Handle::from_str("alice.bsky.social");
+        assert_eq!(h, Handle::BskySocial("alice".to_string()));
+        assert_eq!(h.as_string(), "alice.bsky.social");
+    }
+
+    #[test]
+    fn handle_other_roundtrip() {
+        let h = Handle::from_str("user.example.com");
+        assert_eq!(h, Handle::Other("user.example.com".to_string()));
+        assert_eq!(h.as_string(), "user.example.com");
     }
 
     #[test]
@@ -1699,12 +1737,16 @@ mod tests {
         assert_eq!(e1, ServiceEndpoint::BlueskyPds("example".to_string()));
         assert_eq!(e1.as_string(), "https://example.host.bsky.network");
 
-        let e2 = ServiceEndpoint::from_str("https://other.endpoint.com");
+        let e2 = ServiceEndpoint::from_str("https://bsky.social");
+        assert_eq!(e2, ServiceEndpoint::BlueskySocial);
+        assert_eq!(e2.as_string(), "https://bsky.social");
+
+        let e3 = ServiceEndpoint::from_str("https://other.endpoint.com");
         assert_eq!(
-            e2,
+            e3,
             ServiceEndpoint::Other("https://other.endpoint.com".to_string())
         );
-        assert_eq!(e2.as_string(), "https://other.endpoint.com");
+        assert_eq!(e3.as_string(), "https://other.endpoint.com");
     }
 
     #[test]
