@@ -841,6 +841,7 @@ pub struct Op {
 }
 
 impl Op {
+    // todo: we should probably just have this in Op tbh as a `r#type: SequencedOpType` or something
     /// adds the `type` field to the op
     pub fn to_sequenced_json(&self) -> serde_json::Value {
         let mut val = serde_json::to_value(self).expect("Op is serializable");

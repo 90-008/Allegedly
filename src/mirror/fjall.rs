@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use super::*;
 use futures::{SinkExt as _, StreamExt as _};
 use poem::IntoResponse;
@@ -306,7 +304,6 @@ async fn export_stream(
     Data(FjallState { fjall, .. }): Data<&FjallState>,
 ) -> poem::Result<impl IntoResponse> {
     use poem::web::websocket::Message;
-    use tokio::sync::Notify;
 
     let db = fjall.clone();
 
@@ -358,28 +355,18 @@ async fn export_stream(
     };
 
     Ok(ws.on_upgrade(move |mut socket| async move {
-        let errored = Arc::new(Notify::new());
-
         loop {
             let (tx, mut op_rx) = tokio::sync::mpsc::channel(64);
 
-            tokio::task::spawn_blocking({
+            let read = tokio::task::spawn_blocking({
                 let db = db.clone();
-                let errored = errored.clone();
-                move || {
-                    let iter = match db.export_ops(cursor..) {
-                        Ok(it) => it,
-                        Err(e) => {
-                            log::error!("read failed: {e}");
-                            errored.notify_one();
-                            return;
-                        }
-                    };
-                    for op in iter.flatten() {
+                move || -> anyhow::Result<()> {
+                    for op in db.export_ops(cursor..)?.flatten() {
                         if tx.blocking_send(op).is_err() {
-                            return;
+                            return Ok(());
                         }
                     }
+                    Ok(())
                 }
             });
 
@@ -389,13 +376,22 @@ async fn export_stream(
                     log::warn!("closing export stream: {e}");
                     return;
                 }
-                cursor = op.seq;
+                cursor = op.seq + 1;
             }
 
-            tokio::select! {
-                _ = db.subscribe() => {},
-                _ = errored.notified() => return,
+            match read.await {
+                Ok(Err(e)) => {
+                    log::error!("stream read failed: {e}");
+                    return;
+                }
+                Err(e) => {
+                    log::error!("stream read task panicked: {e}");
+                    return;
+                }
+                Ok(Ok(())) => {}
             }
+
+            db.subscribe().await;
         }
     }))
 }
