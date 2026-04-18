@@ -1031,7 +1031,7 @@ impl FjallDb {
         };
 
         for err in &errors {
-            log::warn!("failed to parse operation {} {}: {err}", op.did, op.cid);
+            log::warn!("dropping op {} {} (seq {seq}) parse error: {err}", op.did, op.cid);
         }
         if !errors.is_empty() {
             // if parse failed but not fatal, we just dont store it
@@ -1069,16 +1069,16 @@ impl FjallDb {
                             .map(|e| e.to_string())
                             .collect::<Vec<_>>()
                             .join("\n");
-                        log::warn!("dropping op {} {} (invalid sig):\n{msg}", op.did, op.cid);
+                        log::warn!("dropping op {} {} (seq {seq}) invalid sig:\n{msg}", op.did, op.cid);
                         return Ok(0);
                     }
                 }
                 Err(e) => {
-                    log::warn!("dropping op {} {}: {e}", op.did, op.cid);
+                    log::warn!("dropping op {} {} (seq {seq}): {e}", op.did, op.cid);
                     return Ok(0);
                 }
             }
-            log::debug!("verified op {} {}", op.did, op.cid);
+            log::debug!("verified op {} {} (seq {seq})", op.did, op.cid);
         }
 
         let db_op = DbOp {
@@ -1104,6 +1104,7 @@ impl FjallDb {
 
         self.inner.notify_stream.notify_waiters();
 
+        log::debug!("inserted op {} {} (seq {seq})", op.did, op.cid);
         Ok(1)
     }
 
@@ -1520,11 +1521,20 @@ pub async fn seq_pages_to_fjall(
     let mut ops_inserted: usize = 0;
 
     while let Some(page) = pages.recv().await {
-        log::trace!("writing seq page with {} ops", page.ops.len());
+        let first_seq = page.ops.first().map(|op| op.seq);
+        let last_seq = page.ops.last().map(|op| op.seq);
+        log::debug!(
+            "seq_pages: received page with {} ops, seq {:?}..{:?}",
+            page.ops.len(),
+            first_seq,
+            last_seq
+        );
+        let page_len = page.ops.len();
         let db = db.clone();
         let count = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let mut count: usize = 0;
             for seq_op in &page.ops {
+                log::debug!("seq_pages: processing op {} {} (seq {})", seq_op.did, seq_op.cid, seq_op.seq);
                 let common_op = CommonOp {
                     did: seq_op.did.clone(),
                     cid: seq_op.cid.clone(),
@@ -1538,6 +1548,14 @@ pub async fn seq_pages_to_fjall(
             Ok(count)
         })
         .await??;
+        if count < page_len {
+            log::warn!(
+                "seq_pages: page seq {:?}..{:?} inserted {count}/{page_len} ops ({} dropped)",
+                first_seq,
+                last_seq,
+                page_len - count
+            );
+        }
         ops_inserted += count;
     }
 

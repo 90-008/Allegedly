@@ -339,6 +339,12 @@ pub async fn poll_upstream_seq(
         }
 
         if !page.is_empty() {
+            log::debug!(
+                "seq poll: page with {} ops, seq {}..{}",
+                page.ops.len(),
+                page.ops.first().map(|op| op.seq).unwrap_or(0),
+                last_seq
+            );
             match dest.try_send(page) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(page)) => {
