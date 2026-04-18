@@ -143,7 +143,7 @@ pub async fn get_page(url: Url) -> Result<(ExportPage, Option<LastOp>), GetPageE
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    log::trace!("Getting page: {url}");
+    tracing::trace!("Getting page: {url}");
 
     let res = CLIENT.get(url).send().await?.error_for_status()?;
     let stream = Box::pin(
@@ -165,12 +165,12 @@ pub async fn get_page(url: Url) -> Result<(ExportPage, Option<LastOp>), GetPageE
                 }
                 match serde_json::from_str::<Op>(line) {
                     Ok(op) => ops.push(op),
-                    Err(e) => log::warn!("failed to parse op: {e} ({line})"),
+                    Err(e) => tracing::warn!("failed to parse op: {e} ({line})"),
                 }
             }
             Ok(None) => break,
             Err(e) => {
-                log::warn!("transport error mid-page: {}; returning partial page", e);
+                tracing::warn!("transport error mid-page: {}; returning partial page", e);
                 break;
             }
         }
@@ -216,7 +216,7 @@ pub async fn poll_upstream(
     throttle: Duration,
     dest: mpsc::Sender<ExportPage>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting upstream poller at {base} after {after:?}");
+    tracing::info!("starting upstream poller at {base} after {after:?}");
     let mut tick = tokio::time::interval(throttle);
     let mut prev_last: Option<LastOp> = after.map(Into::into);
     let mut boundary_state: Option<PageBoundaryState> = None;
@@ -232,7 +232,7 @@ pub async fn poll_upstream(
         let (mut page, next_last) = match get_page(url).await {
             Ok(res) => res,
             Err(e) => {
-                log::warn!("error polling upstream: {e}");
+                tracing::warn!("error polling upstream: {e}");
                 continue;
             }
         };
@@ -246,7 +246,7 @@ pub async fn poll_upstream(
             match dest.try_send(page) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(page)) => {
-                    log::warn!("export: destination channel full, awaiting...");
+                    tracing::warn!("export: destination channel full, awaiting...");
                     dest.send(page).await?;
                 }
                 e => e?,
@@ -263,7 +263,7 @@ async fn get_seq_page(url: Url) -> Result<SeqPage, GetPageError> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    log::trace!("getting seq page: {url}");
+    tracing::trace!("getting seq page: {url}");
 
     let res = CLIENT.get(url).send().await?.error_for_status()?;
     let stream = Box::pin(
@@ -285,12 +285,12 @@ async fn get_seq_page(url: Url) -> Result<SeqPage, GetPageError> {
                 }
                 match serde_json::from_str::<SeqOp>(line) {
                     Ok(op) => ops.push(op),
-                    Err(e) => log::warn!("failed to parse seq op: {e} ({line})"),
+                    Err(e) => tracing::warn!("failed to parse seq op: {e} ({line})"),
                 }
             }
             Ok(None) => break,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "transport error mid-seq-page: {}; returning partial page",
                     e
                 );
@@ -315,7 +315,7 @@ pub async fn poll_upstream_seq(
     throttle: Duration,
     dest: mpsc::Sender<SeqPage>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting seq upstream poller at {base} after {after:?}");
+    tracing::info!("starting seq upstream poller at {base} after {after:?}");
     let mut tick = tokio::time::interval(throttle);
     let mut last_seq: u64 = after.unwrap_or(0);
 
@@ -329,7 +329,7 @@ pub async fn poll_upstream_seq(
         let page = match get_seq_page(url).await {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("error polling upstream (seq): {e}");
+                tracing::warn!("error polling upstream (seq): {e}");
                 continue;
             }
         };
@@ -339,7 +339,7 @@ pub async fn poll_upstream_seq(
         }
 
         if !page.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "seq poll: page with {} ops, seq {}..{}",
                 page.ops.len(),
                 page.ops.first().map(|op| op.seq).unwrap_or(0),
@@ -348,7 +348,7 @@ pub async fn poll_upstream_seq(
             match dest.try_send(page) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(page)) => {
-                    log::warn!("seq poll: destination channel full, awaiting...");
+                    tracing::warn!("seq poll: destination channel full, awaiting...");
                     dest.send(page).await?;
                 }
                 e => e?,
@@ -388,16 +388,16 @@ pub async fn tail_upstream_stream(
             .append_pair("cursor", &seq.to_string());
     }
 
-    log::info!("connecting to stream: {url}");
+    tracing::info!("connecting to stream: {url}");
     let (mut ws, _) = connect_async(url.as_str()).await?;
-    log::info!("stream connected");
+    tracing::info!("stream connected");
 
     while let Some(msg) = ws.next().await {
         let msg = msg?;
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => {
-                log::info!("stream closed by server");
+                tracing::info!("stream closed by server");
                 break;
             }
             _ => continue,
@@ -406,14 +406,14 @@ pub async fn tail_upstream_stream(
         let op: SeqOp = match serde_json::from_str(&text) {
             Ok(op) => op,
             Err(e) => {
-                log::warn!("failed to parse stream event: {e} ({text})");
+                tracing::warn!("failed to parse stream event: {e} ({text})");
                 continue;
             }
         };
 
         let page = SeqPage { ops: vec![op] };
         if dest.send(page).await.is_err() {
-            log::info!("stream dest channel closed, stopping");
+            tracing::info!("stream dest channel closed, stopping");
             break;
         }
     }

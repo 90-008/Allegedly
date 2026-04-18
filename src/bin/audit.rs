@@ -41,19 +41,19 @@ pub async fn run(globals: GlobalArgs, Args { fjall, fix, drop }: Args) -> anyhow
     while let Some(next) = tasks.join_next().await {
         match next {
             Err(e) if e.is_panic() => {
-                log::error!("a joinset task panicked: {e}. bailing now. (should we panic?)");
+                tracing::error!("a joinset task panicked: {e}. bailing now. (should we panic?)");
                 return Err(e.into());
             }
             Err(e) => {
-                log::error!("a joinset task failed to join: {e}");
+                tracing::error!("a joinset task failed to join: {e}");
                 return Err(e.into());
             }
             Ok(Err(e)) => {
-                log::error!("a joinset task completed with error: {e}");
+                tracing::error!("a joinset task completed with error: {e}");
                 return Err(e);
             }
             Ok(Ok(name)) => {
-                log::trace!("a task completed: {name:?}. {} left", tasks.len());
+                tracing::trace!("a task completed: {name:?}. {} left", tasks.len());
             }
         }
     }
@@ -76,7 +76,7 @@ struct CliArgs {
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     bin_init(args.instrumentation.enable_opentelemetry);
-    log::info!("{}", logo("audit"));
+    tracing::info!("{}", logo("audit"));
     run(args.globals, args.args).await?;
     Ok(())
 }

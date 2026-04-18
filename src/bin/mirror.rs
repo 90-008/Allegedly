@@ -105,7 +105,7 @@ pub async fn run(
             if let Some(ref experimental_domain) = experimental_acme_domain {
                 domains.push(experimental_domain.clone())
             }
-            log::info!("configuring acme for https at {domains:?}...");
+            tracing::info!("configuring acme for https at {domains:?}...");
             ListenConf::Acme {
                 domains,
                 cache_path,
@@ -127,16 +127,16 @@ pub async fn run(
     if let Some(fjall_path) = wrap_fjall {
         let db = FjallDb::open(&fjall_path)?;
         if compact_fjall {
-            log::info!("compacting fjall...");
+            tracing::info!("compacting fjall...");
             db.compact()?;
         }
 
-        log::debug!("getting the latest seq from fjall...");
+        tracing::debug!("getting the latest seq from fjall...");
         let latest_seq = db
             .get_latest()?
             .map(|(seq, _)| seq)
             .expect("there to be at least one op in the db. did you backfill?");
-        log::info!("starting seq polling from seq {latest_seq}...");
+        tracing::info!("starting seq polling from seq {latest_seq}...");
 
         let (send_page, recv_page) = mpsc::channel::<allegedly::SeqPage>(8);
 
@@ -153,7 +153,7 @@ pub async fn run(
         tasks.spawn(async move {
             let mut current_seq = latest_seq;
             loop {
-                log::info!("seq polling from seq {current_seq}");
+                tracing::info!("seq polling from seq {current_seq}");
                 let (inner_tx, mut inner_rx) = mpsc::channel::<allegedly::SeqPage>(8);
 
                 // run poller; it ends only when the channel closes
@@ -190,7 +190,7 @@ pub async fn run(
                 current_seq = last_seq_from_poll;
 
                 // switch to streaming
-                log::info!("caught up at seq {current_seq}, switching to /export/stream");
+                tracing::info!("caught up at seq {current_seq}, switching to /export/stream");
                 let (stream_inner_tx, mut stream_inner_rx) = mpsc::channel::<allegedly::SeqPage>(8);
                 let stream_task = tokio::spawn(tail_upstream_stream(
                     Some(current_seq),
@@ -210,9 +210,9 @@ pub async fn run(
 
                 // stream ended/errored — loop back to polling to resync
                 match stream_task.await {
-                    Ok(Ok(())) => log::info!("stream closed cleanly, resyncing via poll"),
-                    Ok(Err(e)) => log::warn!("stream error: {e}, resyncing via poll"),
-                    Err(e) => log::warn!("stream task join error: {e}"),
+                    Ok(Ok(())) => tracing::info!("stream closed cleanly, resyncing via poll"),
+                    Ok(Err(e)) => tracing::warn!("stream error: {e}, resyncing via poll"),
+                    Err(e) => tracing::warn!("stream task join error: {e}"),
                 }
             }
         });
@@ -230,12 +230,12 @@ pub async fn run(
             ))?;
             let db = Db::new(wrap_pg.as_str(), wrap_pg_cert).await?;
 
-            log::debug!("getting the latest op from the db...");
+            tracing::debug!("getting the latest op from the db...");
             let latest = db
                 .get_latest()
                 .await?
                 .expect("there to be at least one op in the db. did you backfill?");
-            log::debug!("starting polling from {latest}...");
+            tracing::debug!("starting polling from {latest}...");
 
             let (send_page, recv_page) = mpsc::channel(8);
 
@@ -256,19 +256,19 @@ pub async fn run(
     while let Some(next) = tasks.join_next().await {
         match next {
             Err(e) if e.is_panic() => {
-                log::error!("a joinset task panicked: {e}. bailing now. (should we panic?)");
+                tracing::error!("a joinset task panicked: {e}. bailing now. (should we panic?)");
                 return Err(e.into());
             }
             Err(e) => {
-                log::error!("a joinset task failed to join: {e}");
+                tracing::error!("a joinset task failed to join: {e}");
                 return Err(e.into());
             }
             Ok(Err(e)) => {
-                log::error!("a joinset task completed with error: {e}");
+                tracing::error!("a joinset task completed with error: {e}");
                 return Err(e);
             }
             Ok(Ok(name)) => {
-                log::trace!("a task completed: {name:?}. {} left", tasks.len());
+                tracing::trace!("a task completed: {name:?}. {} left", tasks.len());
             }
         }
     }
@@ -294,7 +294,7 @@ struct CliArgs {
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     bin_init(args.instrumentation.enable_opentelemetry);
-    log::info!("{}", logo("mirror"));
+    tracing::info!("{}", logo("mirror"));
     run(args.globals, args.args, !args.wrap_mode).await?;
     Ok(())
 }

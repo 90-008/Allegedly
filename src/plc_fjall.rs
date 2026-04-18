@@ -1031,7 +1031,7 @@ impl FjallDb {
         };
 
         for err in &errors {
-            log::warn!("dropping op {} {} (seq {seq}) parse error: {err}", op.did, op.cid);
+            tracing::warn!("dropping op {} {} (seq {seq}) parse error: {err}", op.did, op.cid);
         }
         if !errors.is_empty() {
             // if parse failed but not fatal, we just dont store it
@@ -1069,16 +1069,16 @@ impl FjallDb {
                             .map(|e| e.to_string())
                             .collect::<Vec<_>>()
                             .join("\n");
-                        log::warn!("dropping op {} {} (seq {seq}) invalid sig:\n{msg}", op.did, op.cid);
+                        tracing::warn!("dropping op {} {} (seq {seq}) invalid sig:\n{msg}", op.did, op.cid);
                         return Ok(0);
                     }
                 }
                 Err(e) => {
-                    log::warn!("dropping op {} {} (seq {seq}): {e}", op.did, op.cid);
+                    tracing::warn!("dropping op {} {} (seq {seq}): {e}", op.did, op.cid);
                     return Ok(0);
                 }
             }
-            log::debug!("verified op {} {} (seq {seq})", op.did, op.cid);
+            tracing::debug!("verified op {} {} (seq {seq})", op.did, op.cid);
         }
 
         let db_op = DbOp {
@@ -1104,7 +1104,7 @@ impl FjallDb {
 
         self.inner.notify_stream.notify_waiters();
 
-        log::debug!("inserted op {} {} (seq {seq})", op.did, op.cid);
+        tracing::debug!("inserted op {} {} (seq {seq})", op.did, op.cid);
         Ok(1)
     }
 
@@ -1257,7 +1257,7 @@ impl FjallDb {
         let (seq, by_did_key_bytes) = match (found_seq, found_by_did_key) {
             (Some(s), Some(k)) => (s, k),
             _ => {
-                log::warn!("drop_op: by_did entry not found for {did_str}");
+                tracing::warn!("drop_op: by_did entry not found for {did_str}");
                 return Ok(());
             }
         };
@@ -1310,7 +1310,7 @@ impl FjallDb {
                             });
                             let prev_cid_ok = op.operation.prev.is_none() || prev_op.is_some();
                             if !prev_cid_ok {
-                                log::error!("audit: op {did} {cid} prev cid mismatch or missing predecessor, is db corrupted?");
+                                tracing::error!("audit: op {did} {cid} prev cid mismatch or missing predecessor, is db corrupted?");
                                 failed += 1;
                                 send_invalid();
                                 continue;
@@ -1325,13 +1325,13 @@ impl FjallDb {
                                             .map(|e| e.to_string())
                                             .collect::<Vec<_>>()
                                             .join("\n    ");
-                                        log::warn!("audit: invalid op {} {}:\n    {msg}", did, cid);
+                                        tracing::warn!("audit: invalid op {} {}:\n    {msg}", did, cid);
                                         failed += 1;
                                         send_invalid();
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!("audit: invalid op {} {}: {e}", did, cid);
+                                    tracing::warn!("audit: invalid op {} {}: {e}", did, cid);
                                     failed += 1;
                                     send_invalid();
                                 }
@@ -1437,7 +1437,7 @@ pub async fn backfill_to_fjall(
     if reset {
         let db = db.clone();
         tokio::task::spawn_blocking(move || db.clear()).await??;
-        log::warn!("fjall reset: cleared all data");
+        tracing::warn!("fjall reset: cleared all data");
     }
 
     let mut last_at = None;
@@ -1492,18 +1492,18 @@ pub async fn backfill_to_fjall(
             }
         }
     }
-    log::debug!("finished receiving bulk pages");
+    tracing::debug!("finished receiving bulk pages");
 
     if let Some(notify) = notify_last_at {
-        log::trace!("notifying last_at: {last_at:?}");
+        tracing::trace!("notifying last_at: {last_at:?}");
         if notify.send(last_at).is_err() {
-            log::error!("receiver for last_at dropped, can't notify");
+            tracing::error!("receiver for last_at dropped, can't notify");
         };
     }
 
     tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll)).await??;
 
-    log::info!(
+    tracing::info!(
         "backfill_to_fjall: inserted {ops_inserted} ops in {:?}",
         t0.elapsed()
     );
@@ -1515,7 +1515,7 @@ pub async fn seq_pages_to_fjall(
     db: FjallDb,
     mut pages: mpsc::Receiver<crate::SeqPage>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting seq_pages_to_fjall writer...");
+    tracing::info!("starting seq_pages_to_fjall writer...");
 
     let t0 = Instant::now();
     let mut ops_inserted: usize = 0;
@@ -1523,7 +1523,7 @@ pub async fn seq_pages_to_fjall(
     while let Some(page) = pages.recv().await {
         let first_seq = page.ops.first().map(|op| op.seq);
         let last_seq = page.ops.last().map(|op| op.seq);
-        log::debug!(
+        tracing::debug!(
             "seq_pages: received page with {} ops, seq {:?}..{:?}",
             page.ops.len(),
             first_seq,
@@ -1534,7 +1534,7 @@ pub async fn seq_pages_to_fjall(
         let count = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let mut count: usize = 0;
             for seq_op in &page.ops {
-                log::debug!("seq_pages: processing op {} {} (seq {})", seq_op.did, seq_op.cid, seq_op.seq);
+                tracing::debug!("seq_pages: processing op {} {} (seq {})", seq_op.did, seq_op.cid, seq_op.seq);
                 let common_op = CommonOp {
                     did: seq_op.did.clone(),
                     cid: seq_op.cid.clone(),
@@ -1549,7 +1549,7 @@ pub async fn seq_pages_to_fjall(
         })
         .await??;
         if count < page_len {
-            log::warn!(
+            tracing::warn!(
                 "seq_pages: page seq {:?}..{:?} inserted {count}/{page_len} ops ({} dropped)",
                 first_seq,
                 last_seq,
@@ -1559,7 +1559,7 @@ pub async fn seq_pages_to_fjall(
         ops_inserted += count;
     }
 
-    log::info!(
+    tracing::info!(
         "no more seq pages. inserted {ops_inserted} ops in {:?}",
         t0.elapsed()
     );
@@ -1570,15 +1570,15 @@ pub async fn audit(
     db: FjallDb,
     invalid_ops_tx: mpsc::Sender<InvalidOp>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting fjall audit...");
+    tracing::info!("starting fjall audit...");
     let t0 = std::time::Instant::now();
     let (checked, failed) = tokio::task::spawn_blocking(move || db.audit(invalid_ops_tx)).await??;
-    log::info!(
+    tracing::info!(
         "fjall audit complete in {:?}, {checked} ops checked",
         t0.elapsed()
     );
     if failed > 0 {
-        log::error!("audit found {failed} invalid operations");
+        tracing::error!("audit found {failed} invalid operations");
     }
     Ok("audit_fjall")
 }
@@ -1589,7 +1589,7 @@ pub async fn fix_ops(
     only_drop: bool,
     mut invalid_ops_rx: mpsc::Receiver<InvalidOp>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting fjall fix ops...");
+    tracing::info!("starting fjall fix ops...");
     let mut fixed_dids = std::collections::HashSet::new();
     let mut count = 0;
 
@@ -1615,7 +1615,7 @@ pub async fn fix_ops(
             continue;
         }
 
-        log::trace!("fetching upstream ops to fix did: {did}");
+        tracing::trace!("fetching upstream ops to fix did: {did}");
         let mut url = upstream.clone();
         url.set_path(&format!("/{did}/log/audit"));
 
@@ -1626,21 +1626,21 @@ pub async fn fix_ops(
             StatusCode::OK => match resp.json().await {
                 Ok(ops) => ops,
                 Err(e) => {
-                    log::warn!("failed to parse upstream ops for {did}: {e}");
+                    tracing::warn!("failed to parse upstream ops for {did}: {e}");
                     continue;
                 }
             },
             StatusCode::NOT_FOUND => {
-                log::trace!("did not found upstream: {did}");
+                tracing::trace!("did not found upstream: {did}");
                 Vec::new() // this essentially means drop the whole did
             }
             s => {
-                log::warn!("failed to fetch upstream for {did}: {s}");
+                tracing::warn!("failed to fetch upstream for {did}: {s}");
                 continue;
             }
         };
 
-        log::trace!("fetched {} ops for {did}", ops.len());
+        tracing::trace!("fetched {} ops for {did}", ops.len());
 
         // we drop all ops first just to be safe
         let existing = db.ops_for_did(&did)?;
@@ -1655,7 +1655,7 @@ pub async fn fix_ops(
             // if we don't skip these we might miss some ops in between
             // the latest_at we started with vs the one we ended up with
             if op.created_at > latest_at {
-                log::trace!(
+                tracing::trace!(
                     "skipping op {} for {did} because it is newer than latest_at {latest_at}",
                     op.cid
                 );
@@ -1671,7 +1671,7 @@ pub async fn fix_ops(
         fixed_dids.insert(did);
     }
 
-    log::info!("fixed {count} ops");
+    tracing::info!("fixed {count} ops");
 
     Ok("fix_ops_fjall")
 }

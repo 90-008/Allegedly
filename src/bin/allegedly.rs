@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let matches = Cli::command().get_matches();
     let name = matches.subcommand().map(|(name, _)| name).unwrap_or("???");
     bin_init(args.command.enable_otel());
-    log::info!("{}", logo(name));
+    tracing::info!("{}", logo(name));
 
     let globals = args.globals.clone();
 
@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .expect("to poll upstream")
             });
-            log::trace!("ensuring output directory exists");
+            tracing::trace!("ensuring output directory exists");
             create_dir_all(&dest)
                 .await
                 .expect("to ensure output dir exists");
@@ -143,6 +143,6 @@ async fn main() -> anyhow::Result<()> {
                 .expect("to write pages to stdout");
         }
     }
-    log::info!("whew, {:?}. goodbye!", t0.elapsed());
+    tracing::info!("whew, {:?}. goodbye!", t0.elapsed());
     Ok(())
 }

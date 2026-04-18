@@ -179,7 +179,7 @@ async fn proxy(req: &Request, Data(state): Data<&State>) -> Result<Response> {
         .send()
         .await
         .map_err(|e| {
-            log::error!("upstream req fail: {e}");
+            tracing::error!("upstream req fail: {e}");
             Error::from_string(
                 failed_to_reach_named("wrapped reference PLC"),
                 StatusCode::BAD_GATEWAY,
@@ -215,7 +215,7 @@ async fn forward_create_op_upstream(
     }
 
     let mut headers: reqwest::header::HeaderMap = req.headers().clone();
-    log::trace!("original request headers: {headers:?}");
+    tracing::trace!("original request headers: {headers:?}");
     headers.insert("Host", upstream.host_str().unwrap().parse().unwrap());
     let client_ua = headers
         .get(USER_AGENT)
@@ -227,7 +227,7 @@ async fn forward_create_op_upstream(
             .parse()
             .unwrap(),
     );
-    log::trace!("adjusted request headers: {headers:?}");
+    tracing::trace!("adjusted request headers: {headers:?}");
 
     let mut target = upstream.clone();
     target.set_path(&did);
@@ -239,7 +239,7 @@ async fn forward_create_op_upstream(
         .send()
         .await
         .map_err(|e| {
-            log::warn!("upstream write fail: {e}");
+            tracing::warn!("upstream write fail: {e}");
             Error::from_string(
                 failed_to_reach_named("upstream PLC"),
                 StatusCode::BAD_GATEWAY,
@@ -274,7 +274,7 @@ pub async fn serve(
     experimental: ExperimentalConf,
     db: Option<Db>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting server...");
+    tracing::info!("starting server...");
 
     let client = Client::builder()
         .user_agent(UA)
@@ -306,7 +306,7 @@ pub async fn serve(
         .at("/export", get(proxy));
 
     if experimental.write_upstream {
-        log::info!("enabling experimental write forwarding to upstream");
+        tracing::info!("enabling experimental write forwarding to upstream");
 
         let ip_limiter = IpLimiters::new(Quota::per_hour(10.try_into().unwrap()));
         let did_limiter = CreatePlcOpLimiter::new(Quota::per_hour(4.try_into().unwrap()));

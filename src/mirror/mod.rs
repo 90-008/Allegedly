@@ -184,12 +184,12 @@ where
             }
             let auto_cert = auto_cert.build().expect("acme config to build");
 
-            log::trace!("auto_cert: {auto_cert:?}");
+            tracing::trace!("auto_cert: {auto_cert:?}");
 
             let notice_task = tokio::task::spawn(run_insecure_notice(ipv6));
             let listener = TcpListener::bind(if ipv6 { "[::]:443" } else { "0.0.0.0:443" });
             let app_res = run(app, listener.acme(auto_cert)).await;
-            log::warn!("server task ended, aborting insecure server task...");
+            tracing::warn!("server task ended, aborting insecure server task...");
             notice_task.abort();
             app_res?;
             notice_task.await??;

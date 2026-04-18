@@ -61,7 +61,7 @@ impl Limiter<String> for CreatePlcOpLimiter {
             .map_err(|e| e.wait_time_from(CLOCK.now()))
     }
     fn housekeep(&self) {
-        log::debug!(
+        tracing::debug!(
             "limiter size before housekeeping: {} dids",
             self.limiter.len()
         );
@@ -125,7 +125,7 @@ impl Limiter<IpAddr> for IpLimiters {
         }
     }
     fn housekeep(&self) {
-        log::debug!(
+        tracing::debug!(
             "limiter sizes before housekeeping: {}/ip {}/v6_56 {}/v6_48",
             self.per_ip.len(),
             self.ip6_56.len(),
@@ -205,13 +205,13 @@ where
 
         match self.limiters.check_key(&key) {
             Ok(_) => {
-                log::debug!("allowing key {key:?}");
+                tracing::debug!("allowing key {key:?}");
                 self.ep.call(req).await
             }
             Err(d) => {
                 let wait_time = d.as_secs();
 
-                log::debug!("rate limit exceeded for {key:?}, quota reset in {wait_time}s");
+                tracing::debug!("rate limit exceeded for {key:?}, quota reset in {wait_time}s");
 
                 let res = Response::builder()
                     .status(StatusCode::TOO_MANY_REQUESTS)

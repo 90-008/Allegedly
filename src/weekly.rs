@@ -97,10 +97,10 @@ impl BundleSource for FolderSource {
     async fn reader_for(&self, week: Week) -> anyhow::Result<impl AsyncRead> {
         let FolderSource(dir) = self;
         let path = dir.join(format!("{}.jsonl.gz", week.0));
-        log::debug!("opening folder source: {path:?}");
+        tracing::debug!("opening folder source: {path:?}");
         let file = File::open(path)
             .await
-            .inspect_err(|e| log::error!("failed to open file: {e}"))?;
+            .inspect_err(|e| tracing::error!("failed to open file: {e}"))?;
         let decoder = GzipDecoder::new(BufReader::new(file));
         Ok(decoder)
     }
@@ -151,7 +151,7 @@ pub async fn pages_to_weeks(
                 encoder.shutdown().await?;
                 let now = Instant::now();
 
-                log::info!(
+                tracing::info!(
                     "done week {:3 } ({:10 }): {week_ops:7 } ({:5.0 }/s) ops, {:5 }k total ({:5.0 }/s)",
                     current_week.map(|w| -w.n_ago()).unwrap_or(0),
                     current_week.unwrap_or(Week(0)).0,
@@ -170,7 +170,7 @@ pub async fn pages_to_weeks(
                 week_ops = 0;
                 week_t0 = now;
             }
-            log::trace!("writing: {op:?}");
+            tracing::trace!("writing: {op:?}");
             encoder
                 .write_all(serde_json::to_string(&op)?.as_bytes())
                 .await?;
@@ -182,7 +182,7 @@ pub async fn pages_to_weeks(
     // don't forget the final file
     encoder.shutdown().await?;
     let now = Instant::now();
-    log::info!(
+    tracing::info!(
         "done week {:3 } ({:10 }): {week_ops:7 } ({:5.0 }/s) ops, {:5 }k total ({:5.0 }/s)",
         current_week.map(|w| -w.n_ago()).unwrap_or(0),
         current_week.unwrap_or(Week(0)).0,
@@ -206,7 +206,7 @@ pub async fn week_to_pages(
         let reader = match source.reader_for(week).await {
             Ok(r) => r,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "week_to_pages reader_for failed {e}, retrying in {}s",
                     retry_backoff.as_secs()
                 );
@@ -223,7 +223,7 @@ pub async fn week_to_pages(
             Ok(Some(c)) => Some(c),
             Ok(None) => None,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "failed to get next chunk: {e}, retrying week in {}s",
                     retry_backoff.as_secs()
                 );
@@ -237,7 +237,7 @@ pub async fn week_to_pages(
                 .into_iter()
                 .filter_map(|s| {
                     serde_json::from_str::<Op>(&s)
-                        .inspect_err(|e| log::warn!("failed to parse op: {e} ({s})"))
+                        .inspect_err(|e| tracing::warn!("failed to parse op: {e} ({s})"))
                         .ok()
                 })
                 .collect();
@@ -248,7 +248,7 @@ pub async fn week_to_pages(
 
             let page = ExportPage { ops };
             if let Err(e) = dest.send(page).await {
-                log::error!("failed to send page (receiver closed): {e}");
+                tracing::error!("failed to send page (receiver closed): {e}");
                 return Err(e.into());
             }
         }

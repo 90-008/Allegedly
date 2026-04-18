@@ -49,7 +49,7 @@ impl Db {
     pub async fn new(pg_uri: &str, cert: Option<PathBuf>) -> Result<Self, anyhow::Error> {
         // we're going to interact with did-method-plc's database, so make sure
         // it's what we expect: check for db migrations.
-        log::trace!("checking migrations...");
+        tracing::trace!("checking migrations...");
 
         let connector = cert.map(get_tls).transpose()?;
 
@@ -77,7 +77,7 @@ impl Db {
         drop(client);
         // make sure the connection worker thing doesn't linger
         conn_task.await??;
-        log::info!("db connection succeeded and plc migrations appear as expected");
+        tracing::info!("db connection succeeded and plc migrations appear as expected");
 
         Ok(Self {
             pg_uri: pg_uri.to_string(),
@@ -86,7 +86,7 @@ impl Db {
     }
 
     pub async fn connect(&self) -> Result<(Client, JoinHandle<Result<(), PgError>>), PgError> {
-        log::trace!("connecting postgres...");
+        tracing::trace!("connecting postgres...");
         if let Some(ref connector) = self.cert {
             get_client_and_task(&self.pg_uri, connector.clone()).await
         } else {
@@ -115,7 +115,7 @@ pub async fn pages_to_pg(
     db: Db,
     mut pages: mpsc::Receiver<ExportPage>,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting pages_to_pg writer...");
+    tracing::info!("starting pages_to_pg writer...");
 
     let (mut client, task) = db.connect().await?;
 
@@ -135,7 +135,7 @@ pub async fn pages_to_pg(
     let mut dids_inserted = 0;
 
     while let Some(page) = pages.recv().await {
-        log::trace!("writing page with {} ops", page.ops.len());
+        tracing::trace!("writing page with {} ops", page.ops.len());
         let tx = client.transaction().await?;
         for op in page.ops {
             ops_inserted += tx
@@ -156,7 +156,7 @@ pub async fn pages_to_pg(
     }
     drop(task);
 
-    log::info!(
+    tracing::info!(
         "no more pages. inserted {ops_inserted} ops and {dids_inserted} dids in {:?}",
         t0.elapsed()
     );
@@ -194,7 +194,7 @@ pub async fn backfill_to_pg(
         if reset {
             let n = tx.execute(&format!("DELETE FROM {table}"), &[]).await?;
             if n > 0 {
-                log::warn!("postgres reset: deleted {n} from {table}");
+                tracing::warn!("postgres reset: deleted {n} from {table}");
             }
         } else {
             let n: i64 = tx
@@ -206,23 +206,23 @@ pub async fn backfill_to_pg(
             }
         }
     }
-    log::trace!("tables clean: {:?}", t_step.elapsed());
+    tracing::trace!("tables clean: {:?}", t_step.elapsed());
 
     let t_step = Instant::now();
     tx.execute("ALTER TABLE operations SET UNLOGGED", &[])
         .await?;
     tx.execute("ALTER TABLE dids SET UNLOGGED", &[]).await?;
-    log::trace!("set tables unlogged: {:?}", t_step.elapsed());
+    tracing::trace!("set tables unlogged: {:?}", t_step.elapsed());
 
     let t_step = Instant::now();
     tx.execute(r#"DROP INDEX "operations_createdAt_index""#, &[])
         .await?;
     tx.execute("DROP INDEX operations_did_createdat_idx", &[])
         .await?;
-    log::trace!("indexes dropped: {:?}", t_step.elapsed());
+    tracing::trace!("indexes dropped: {:?}", t_step.elapsed());
 
     let t_step = Instant::now();
-    log::trace!("starting binary COPY IN...");
+    tracing::trace!("starting binary COPY IN...");
     let types = &[
         Type::TEXT,
         Type::JSONB,
@@ -256,17 +256,17 @@ pub async fn backfill_to_pg(
             last_at = last_at.filter(|&l| l >= s.last_at).or(Some(s.last_at));
         }
     }
-    log::debug!("finished receiving bulk pages");
+    tracing::debug!("finished receiving bulk pages");
 
     if let Some(notify) = notify_last_at {
-        log::trace!("notifying last_at: {last_at:?}");
+        tracing::trace!("notifying last_at: {last_at:?}");
         if notify.send(last_at).is_err() {
-            log::error!("receiver for last_at dropped, can't notify");
+            tracing::error!("receiver for last_at dropped, can't notify");
         };
     }
 
     let n = writer.as_mut().finish().await?;
-    log::trace!("COPY IN wrote {n} ops: {:?}", t_step.elapsed());
+    tracing::trace!("COPY IN wrote {n} ops: {:?}", t_step.elapsed());
 
     // CAUTION: these indexes MUST match up exactly with the kysely ones we dropped
     let t_step = Instant::now();
@@ -280,7 +280,7 @@ pub async fn backfill_to_pg(
         &[],
     )
     .await?;
-    log::trace!("indexes recreated: {:?}", t_step.elapsed());
+    tracing::trace!("indexes recreated: {:?}", t_step.elapsed());
 
     let t_step = Instant::now();
     let n = tx
@@ -289,16 +289,16 @@ pub async fn backfill_to_pg(
             &[],
         )
         .await?;
-    log::trace!("INSERT wrote {n} dids: {:?}", t_step.elapsed());
+    tracing::trace!("INSERT wrote {n} dids: {:?}", t_step.elapsed());
 
     let t_step = Instant::now();
     tx.execute("ALTER TABLE dids SET LOGGED", &[]).await?;
     tx.execute("ALTER TABLE operations SET LOGGED", &[]).await?;
-    log::trace!("set tables LOGGED: {:?}", t_step.elapsed());
+    tracing::trace!("set tables LOGGED: {:?}", t_step.elapsed());
 
     tx.commit().await?;
     drop(task);
-    log::info!("total backfill time: {:?}", t0.elapsed());
+    tracing::info!("total backfill time: {:?}", t0.elapsed());
 
     Ok("backfill_to_pg")
 }

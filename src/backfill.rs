@@ -25,7 +25,7 @@ pub async fn backfill(
     let mut workers: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     let t_step = Instant::now();
-    log::info!(
+    tracing::info!(
         "fetching backfill for {} weeks with {source_workers} workers...",
         weeks.lock().await.len()
     );
@@ -38,12 +38,12 @@ pub async fn backfill(
         workers.spawn(async move {
             while let Some(week) = weeks.lock().await.pop() {
                 let when = Into::<Dt>::into(week).to_rfc3339();
-                log::trace!("worker {w}: fetching week {when} (-{})", week.n_ago());
+                tracing::trace!("worker {w}: fetching week {when} (-{})", week.n_ago());
                 week_to_pages(source.clone(), week, dest.clone())
                     .await
-                    .inspect_err(|e| log::error!("failing week_to_pages: {e}"))?;
+                    .inspect_err(|e| tracing::error!("failing week_to_pages: {e}"))?;
             }
-            log::info!("done with the weeks ig");
+            tracing::info!("done with the weeks ig");
             Ok(())
         });
     }
@@ -52,10 +52,10 @@ pub async fn backfill(
 
     // wait for the big backfill to finish
     while let Some(res) = workers.join_next().await {
-        res.inspect_err(|e| log::error!("problem joining source workers: {e}"))?
-            .inspect_err(|e| log::error!("problem *from* source worker: {e}"))?;
+        res.inspect_err(|e| tracing::error!("problem joining source workers: {e}"))?
+            .inspect_err(|e| tracing::error!("problem *from* source worker: {e}"))?;
     }
-    log::info!(
+    tracing::info!(
         "finished fetching backfill in {:?}. senders remaining: {}",
         t_step.elapsed(),
         dest.strong_count()

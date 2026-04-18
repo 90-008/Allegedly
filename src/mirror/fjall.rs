@@ -382,7 +382,7 @@ async fn export_stream(
             while let Some(op) = op_rx.recv().await {
                 let json = serde_json::to_string(&op.to_sequenced_json()).unwrap();
                 if let Err(e) = socket.send(Message::Text(json)).await {
-                    log::warn!("closing export stream: {e}");
+                    tracing::warn!("closing export stream: {e}");
                     return;
                 }
                 cursor = op.seq + 1;
@@ -390,11 +390,11 @@ async fn export_stream(
 
             match read.await {
                 Ok(Err(e)) => {
-                    log::error!("stream read failed: {e}");
+                    tracing::error!("stream read failed: {e}");
                     return;
                 }
                 Err(e) => {
-                    log::error!("stream read task panicked: {e}");
+                    tracing::error!("stream read task panicked: {e}");
                     return;
                 }
                 Ok(Ok(())) => {}
@@ -429,7 +429,7 @@ pub async fn serve_fjall(
     experimental: ExperimentalConf,
     fjall: FjallDb,
 ) -> anyhow::Result<&'static str> {
-    log::info!("starting fjall mirror server...");
+    tracing::info!("starting fjall mirror server...");
 
     let client = Client::builder()
         .user_agent(UA)
@@ -461,7 +461,7 @@ pub async fn serve_fjall(
         .at("/export/stream", get(export_stream));
 
     if experimental.write_upstream {
-        log::info!("enabling experimental write forwarding to upstream");
+        tracing::info!("enabling experimental write forwarding to upstream");
 
         let ip_limiter = IpLimiters::new(Quota::per_hour(10.try_into().unwrap()));
         let did_limiter = CreatePlcOpLimiter::new(Quota::per_hour(4.try_into().unwrap()));
@@ -514,7 +514,7 @@ async fn fjall_forward_create_op_upstream(
     }
 
     let mut headers: reqwest::header::HeaderMap = req.headers().clone();
-    log::trace!("original request headers: {headers:?}");
+    tracing::trace!("original request headers: {headers:?}");
     headers.insert("Host", upstream.host_str().unwrap().parse().unwrap());
     let client_ua = headers
         .get(USER_AGENT)
@@ -526,7 +526,7 @@ async fn fjall_forward_create_op_upstream(
             .parse()
             .unwrap(),
     );
-    log::trace!("adjusted request headers: {headers:?}");
+    tracing::trace!("adjusted request headers: {headers:?}");
 
     let mut target = upstream.clone();
     target.set_path(&did);
@@ -538,7 +538,7 @@ async fn fjall_forward_create_op_upstream(
         .send()
         .await
         .map_err(|e| {
-            log::warn!("upstream write fail: {e}");
+            tracing::warn!("upstream write fail: {e}");
             Error::from_string(
                 failed_to_reach_named("upstream PLC"),
                 StatusCode::BAD_GATEWAY,

@@ -99,13 +99,13 @@ pub async fn run(
     if no_bulk {
         // simple mode, just poll upstream from teh beginning
         if http != DEFAULT_HTTP.parse()? {
-            log::warn!("ignoring non-default bulk http setting since --no-bulk was set");
+            tracing::warn!("ignoring non-default bulk http setting since --no-bulk was set");
         }
         if let Some(d) = dir {
-            log::warn!("ignoring bulk dir setting ({d:?}) since --no-bulk was set.");
+            tracing::warn!("ignoring bulk dir setting ({d:?}) since --no-bulk was set.");
         }
         if let Some(u) = until {
-            log::warn!(
+            tracing::warn!(
                 "ignoring `until` setting ({u:?}) since --no-bulk was set. (feature request?)"
             );
         }
@@ -113,9 +113,9 @@ pub async fn run(
         upstream.set_path("/export");
         let throttle = Duration::from_millis(upstream_throttle_ms);
         if let Some(fjall_path) = to_fjall {
-            log::trace!("opening fjall db at {fjall_path:?}...");
+            tracing::trace!("opening fjall db at {fjall_path:?}...");
             let db = FjallDb::open(&fjall_path)?;
-            log::trace!("opened fjall db");
+            tracing::trace!("opened fjall db");
 
             let (poll_tx, poll_out) = mpsc::channel::<SeqPage>(128); // normal/small pages
             let (full_tx, full_out) = mpsc::channel::<SeqPage>(1); // don't need to buffer at this filter
@@ -166,9 +166,9 @@ pub async fn run(
 
         // set up sinks
         if let Some(pg_url) = to_postgres {
-            log::trace!("connecting to postgres...");
+            tracing::trace!("connecting to postgres...");
             let db = Db::new(pg_url.as_str(), postgres_cert).await?;
-            log::trace!("connected to postgres");
+            tracing::trace!("connected to postgres");
 
             tasks.spawn(backfill_to_pg(db.clone(), reset, bulk_out, found_last_tx));
             if catch_up {
@@ -185,19 +185,19 @@ pub async fn run(
     while let Some(next) = tasks.join_next().await {
         match next {
             Err(e) if e.is_panic() => {
-                log::error!("a joinset task panicked: {e}. bailing now. (should we panic?)");
+                tracing::error!("a joinset task panicked: {e}. bailing now. (should we panic?)");
                 return Err(e.into());
             }
             Err(e) => {
-                log::error!("a joinset task failed to join: {e}");
+                tracing::error!("a joinset task failed to join: {e}");
                 return Err(e.into());
             }
             Ok(Err(e)) => {
-                log::error!("a joinset task completed with error: {e}");
+                tracing::error!("a joinset task completed with error: {e}");
                 return Err(e);
             }
             Ok(Ok(name)) => {
-                log::trace!("a task completed: {name:?}. {} left", tasks.len());
+                tracing::trace!("a task completed: {name:?}. {} left", tasks.len());
             }
         }
     }
@@ -218,7 +218,7 @@ struct CliArgs {
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     bin_init(false);
-    log::info!("{}", logo("backfill"));
+    tracing::info!("{}", logo("backfill"));
     run(args.globals, args.args).await?;
     Ok(())
 }
