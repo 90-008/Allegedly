@@ -177,7 +177,10 @@ pub async fn run(
                     if let Some(last) = page.ops.last() {
                         last_seq_from_poll = last.seq;
                     }
-                    let _ = send_page_bg.send(page).await;
+                    if send_page_bg.send(page).await.is_err() {
+                        poll_task.abort();
+                        return anyhow::Ok("fjall-poll-stream (dest closed)");
+                    }
                     if near_tip {
                         break;
                     }

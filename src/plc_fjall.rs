@@ -4,7 +4,10 @@ use crate::{
 };
 use anyhow::Context;
 use data_encoding::BASE32_NOPAD;
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, config::BlockSizePolicy};
+use fjall::{
+    Database, Keyspace, KeyspaceCreateOptions, PersistMode,
+    config::{BlockSizePolicy, RestartIntervalPolicy},
+};
 use ordered_varint::Variable;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -360,7 +363,7 @@ impl ServiceEndpoint {
 // STABILITY: never reorder variants, only append.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
 enum Handle {
-    Other(String),    // 0
+    Other(String),      // 0
     BskySocial(String), // 1
 }
 
@@ -958,7 +961,7 @@ impl FjallDb {
                 .max_memtable_size(mb(192))
                 // this wont compress terribly well since its a bunch of CIDs and signatures and did:keys
                 // and we want to keep reads fast since we'll be reading a lot...
-                .data_block_size_policy(BlockSizePolicy::new([kb(4), kb(8), kb(32)]))
+                .data_block_size_policy(BlockSizePolicy::new([kb(8), kb(32), kb(64), kb(128)]))
                 // this has no downsides, since the only point reads that might miss we do is on by_did
                 .expect_point_read_hits(true)
         })?;
@@ -968,6 +971,9 @@ impl FjallDb {
                 // this isn't gonna compress well anyway, since its just keys (did + seq)
                 // and dids dont have many operations in the first place, so we can use small blocks
                 .data_block_size_policy(BlockSizePolicy::all(kb(2)))
+                // lower restart interval since plcs are hashes, and dids dont have
+                // many ops in themselves
+                .data_block_restart_interval_policy(RestartIntervalPolicy::all(8))
         })?;
         Ok(Self {
             inner: Arc::new(FjallInner {
@@ -1063,12 +1069,12 @@ impl FjallDb {
                             .map(|e| e.to_string())
                             .collect::<Vec<_>>()
                             .join("\n");
-                        log::warn!("invalid op {} {}:\n{msg}", op.did, op.cid);
+                        log::warn!("dropping op {} {} (invalid sig):\n{msg}", op.did, op.cid);
                         return Ok(0);
                     }
                 }
                 Err(e) => {
-                    log::warn!("invalid op {} {}: {e}", op.did, op.cid);
+                    log::warn!("dropping op {} {}: {e}", op.did, op.cid);
                     return Ok(0);
                 }
             }
@@ -1759,17 +1765,18 @@ mod tests {
 
     #[test]
     fn stored_op_fixture_roundtrip() {
-        let fixtures = [
-            "tests/fixtures/log_bskyapp.json",
-            "tests/fixtures/log_legacy_dholms.json",
-            "tests/fixtures/log_nullification.json",
-            "tests/fixtures/log_tombstone.json",
-        ];
+        let mut fixtures: Vec<_> = std::fs::read_dir("tests/fixtures")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
+            .collect();
+        fixtures.sort();
 
         let mut total_json_size = 0;
         let mut total_packed_size = 0;
 
-        for path in fixtures {
+        for path in &fixtures {
             let data = std::fs::read_to_string(path).unwrap();
             let entries: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap();
 
@@ -1777,7 +1784,7 @@ mod tests {
                 let op = &entry["operation"];
                 let (stored, errors) = StoredOp::from_json_value(op.clone());
                 if !errors.is_empty() {
-                    let mut msg = format!("failed to parse op in {path}:\n");
+                    let mut msg = format!("failed to parse op in {}:\n", path.display());
                     for e in errors {
                         msg.push_str(&format!("  - {e:?}\n"));
                     }
@@ -1790,7 +1797,12 @@ mod tests {
                 let unpacked: StoredOp = bitcode::decode::<StoredOp>(&packed).unwrap();
 
                 let reconstructed = unpacked.to_json_value();
-                assert_eq!(*op, reconstructed, "roundtrip mismatch in {path}");
+                assert_eq!(
+                    *op,
+                    reconstructed,
+                    "roundtrip mismatch in {}",
+                    path.display()
+                );
 
                 total_json_size += serde_json::to_vec(op).unwrap().len();
                 total_packed_size += packed.len();
@@ -1803,5 +1815,52 @@ mod tests {
             total_packed_size,
             total_json_size as isize - total_packed_size as isize
         );
+    }
+
+    #[test]
+    fn stored_op_fixture_sig_roundtrip() {
+        let mut fixtures: Vec<_> = std::fs::read_dir("tests/fixtures")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
+            .collect();
+        fixtures.sort();
+
+        for path in &fixtures {
+            let data = std::fs::read_to_string(path).unwrap();
+            let entries: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap();
+
+            // build a cid -> StoredOp map so we can look up prev ops
+            let mut by_cid: std::collections::HashMap<String, StoredOp> =
+                std::collections::HashMap::new();
+
+            for entry in &entries {
+                let cid = entry["cid"].as_str().unwrap().to_string();
+                let op_json = entry["operation"].clone();
+
+                let (stored, errors) = StoredOp::from_json_value(op_json);
+                assert!(
+                    errors.is_empty(),
+                    "{} {cid}: parse errors: {errors:?}",
+                    path.display()
+                );
+                let stored = stored.unwrap();
+
+                let prev = stored.prev.as_ref().map(|c| c.to_string());
+                let prev_stored = prev.as_deref().and_then(|c| by_cid.get(c));
+
+                let results = verify_op_sig(&stored, prev_stored)
+                    .unwrap_or_else(|e| panic!("{} {cid}: {e}", path.display()));
+                assert!(
+                    results.valid,
+                    "{} {cid}: sig invalid after StoredOp roundtrip: {:?}",
+                    path.display(),
+                    results.errors
+                );
+
+                by_cid.insert(cid, stored);
+            }
+        }
     }
 }

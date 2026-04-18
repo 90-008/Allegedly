@@ -159,14 +159,15 @@ mod tests {
 
     #[test]
     fn test_fixture_signatures() {
-        let fixtures = [
-            "tests/fixtures/log_bskyapp.json",
-            "tests/fixtures/log_legacy_dholms.json",
-            "tests/fixtures/log_nullification.json",
-            "tests/fixtures/log_tombstone.json",
-        ];
+        let mut fixtures: Vec<_> = std::fs::read_dir("tests/fixtures")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
+            .collect();
+        fixtures.sort();
 
-        for path in fixtures {
+        for path in &fixtures {
             let data = std::fs::read_to_string(path).unwrap();
             let entries: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap();
 
@@ -199,16 +200,17 @@ mod tests {
 
                 assert!(
                     !valid_keys.is_empty(),
-                    "{path}/{cid}: no keys to verify against"
+                    "{}/{cid}: no keys to verify against",
+                    path.display()
                 );
 
                 let results = assure_valid_sig(&valid_keys, &sig, &data)
                     .expect("that we used the function correctly");
                 for err in results.errors {
-                    println!("{path}/{cid}: {err}");
+                    println!("{}/{cid}: {err}", path.display());
                 }
                 if !results.valid {
-                    panic!("signature verification failed in {path}/{cid}");
+                    panic!("signature verification failed in {}/{cid}", path.display());
                 }
 
                 ops_by_cid.insert(cid, data);
