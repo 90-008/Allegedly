@@ -150,6 +150,7 @@ pub async fn run(
         // the poll -> stream task: poll until we're caught up, then switch to stream.
         // on stream disconnect, fall back to polling to resync.
         let send_page_bg = send_page.clone();
+        let db_for_poll = db.clone();
         tasks.spawn(async move {
             let mut current_seq = latest_seq;
             loop {
@@ -213,6 +214,25 @@ pub async fn run(
                     Ok(Ok(())) => tracing::info!("stream closed cleanly, resyncing via poll"),
                     Ok(Err(e)) => tracing::warn!("stream error: {e}, resyncing via poll"),
                     Err(e) => tracing::warn!("stream task join error: {e}"),
+                }
+
+                // rest current_seq to what's actually in the DB. current_seq tracks
+                // pages forwarded to seq_pages_to_fjall, which may be ahead of what
+                // was actually stored (ops can be dropped by VERIFY=true). polling
+                // from the in-memory current_seq would permanently skip those ops.
+                let db = db_for_poll.clone();
+                match tokio::task::spawn_blocking(move || db.get_latest()).await {
+                    Ok(Ok(Some((seq, _)))) => {
+                        if seq < current_seq {
+                            tracing::info!(
+                                "resetting poll cursor from {current_seq} to db latest {seq} to avoid skipping dropped ops"
+                            );
+                            current_seq = seq;
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => tracing::warn!("failed to read db latest for poll reset: {e}"),
+                    Err(e) => tracing::warn!("spawn_blocking failed for poll reset: {e}"),
                 }
             }
         });
