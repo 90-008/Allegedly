@@ -145,7 +145,7 @@ async fn fjall_health(Data(FjallState { sync_info, .. }): Data<&FjallState>) -> 
 #[handler]
 async fn fjall_resolve(req: &Request, Data(state): Data<&FjallState>) -> Result<Response> {
     let path = req.uri().path();
-    let did_and_rest = path.strip_prefix("/").unwrap_or(path);
+    let did_and_rest = path.trim_end_matches("/").strip_prefix("/").unwrap_or(path);
 
     let (did, sub_path) = match did_and_rest.find('/') {
         Some(i) => (&did_and_rest[..i], &did_and_rest[i..]),
